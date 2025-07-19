@@ -1,11 +1,17 @@
 import threading
+import platform
 
 import evillimiter.console.shell as shell
 from .host import Host
-from evillimiter.common.globals import BIN_TC, BIN_IPTABLES
+from evillimiter.common.globals import IS_MACOS, IS_LINUX
+
+if IS_LINUX:
+    from evillimiter.common.globals import BIN_TC, BIN_IPTABLES
+elif IS_MACOS:
+    from .limit_macos import MacOSLimiter
 
 
-class Limiter(object):
+class LinuxLimiter(object):
     class HostLimitIDs(object):
         def __init__(self, upload_id, download_id):
             self.upload_id = upload_id
@@ -105,7 +111,7 @@ class Limiter(object):
                 host_ids = self._host_dict[host]['ids']
                 self.unlimit(host, direction)
         
-        return Limiter.HostLimitIDs(*self._create_ids()) if host_ids is None else host_ids
+        return LinuxLimiter.HostLimitIDs(*self._create_ids()) if host_ids is None else host_ids
 
     def _create_ids(self):
         """
@@ -148,6 +154,22 @@ class Limiter(object):
         if (direction & Direction.INCOMING) == Direction.INCOMING:
             shell.execute_suppressed('{} -t mangle -D PREROUTING -d {} -j MARK --set-mark {}'.format(BIN_IPTABLES, host.ip, id_))
             shell.execute_suppressed('{} -t filter -D FORWARD -d {} -j DROP'.format(BIN_IPTABLES, host.ip))
+
+
+def create_limiter(interface):
+    """
+    Factory function to create the appropriate limiter based on the OS
+    """
+    if IS_LINUX:
+        return LinuxLimiter(interface)
+    elif IS_MACOS:
+        return MacOSLimiter(interface)
+    else:
+        raise RuntimeError('Unsupported operating system')
+
+
+# For backward compatibility
+Limiter = LinuxLimiter
 
 
 class Direction:

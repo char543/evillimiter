@@ -13,8 +13,9 @@ from evillimiter.console.io import IO
 from evillimiter.console.chart import BarChart
 from evillimiter.console.banner import get_main_banner
 from evillimiter.networking.host import Host
-from evillimiter.networking.limit import Limiter, Direction
+from evillimiter.networking.limit import create_limiter, Direction
 from evillimiter.networking.spoof import ARPSpoofer
+from evillimiter.networking.dns_spoof import DNSSpoofer
 from evillimiter.networking.scan import HostScanner
 from evillimiter.networking.monitor import BandwidthMonitor
 from evillimiter.networking.watch import HostWatcher
@@ -37,11 +38,13 @@ class MainMenu(CommandMenu):
         limit_parser.add_parameter('rate')
         limit_parser.add_flag('--upload', 'upload')
         limit_parser.add_flag('--download', 'download')
+        limit_parser.add_parameterized_flag('--dns', 'dns')
 
         block_parser = self.parser.add_subparser('block', self._block_handler)
         block_parser.add_parameter('id')
         block_parser.add_flag('--upload', 'upload')
         block_parser.add_flag('--download', 'download')
+        block_parser.add_parameterized_flag('--dns', 'dns')
 
         free_parser = self.parser.add_subparser('free', self._free_handler)
         free_parser.add_parameter('id')
@@ -66,6 +69,11 @@ class MainMenu(CommandMenu):
         watch_set_parser.add_parameter('attribute')
         watch_set_parser.add_parameter('value')
 
+        portal_parser = self.parser.add_subparser('portal', self._portal_handler)
+        portal_parser.add_parameter('action')
+        portal_parser.add_parameter('id')
+        portal_parser.add_parameterized_flag('--ip', 'redirect_ip')
+
         self.parser.add_subparser('help', self._help_handler)
         self.parser.add_subparser('?', self._help_handler)
 
@@ -83,7 +91,8 @@ class MainMenu(CommandMenu):
 
         self.host_scanner = HostScanner(self.interface, self.iprange)
         self.arp_spoofer = ARPSpoofer(self.interface, self.gateway_ip, self.gateway_mac)
-        self.limiter = Limiter(self.interface)
+        self.dns_spoofer = None  # Will be initialized when portal is enabled
+        self.limiter = create_limiter(self.interface)
         self.bandwidth_monitor = BandwidthMonitor(self.interface, 1)
         self.host_watcher = HostWatcher(self.host_scanner, self._reconnect_callback)
 
@@ -108,6 +117,9 @@ class MainMenu(CommandMenu):
 
         self.arp_spoofer.stop()
         self.bandwidth_monitor.stop()
+        
+        if self.dns_spoofer:
+            self.dns_spoofer.stop()
 
         for host in self.hosts:
             self._free_host(host)
@@ -189,6 +201,36 @@ class MainMenu(CommandMenu):
 
         direction = self._parse_direction_args(args)
 
+        # Handle DNS redirection if specified
+        if args.dns is not None:
+            # Initialize DNS spoofer if needed
+            if not self.dns_spoofer:
+                # Default redirect to gateway if no specific IP provided
+                self.dns_spoofer = DNSSpoofer(self.interface, self.gateway_ip)
+                self.dns_spoofer.start()
+                
+            if args.dns == "":
+                # No domains specified, redirect all DNS
+                for host in hosts:
+                    self.dns_spoofer.add(host)
+                    IO.ok('{}{}{} DNS queries redirected to gateway.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL))
+            else:
+                # Parse DNS arguments
+                dns_mappings = self._parse_dns_args(args.dns)
+                if dns_mappings is None:
+                    return
+                    
+                for host in hosts:
+                    self.dns_spoofer.add(host)
+                    self.dns_spoofer.set_domain_mapping(host.ip, dns_mappings)
+                    if isinstance(dns_mappings, dict):
+                        IO.ok('{}{}{} DNS mapping configured for {} domains.'.format(
+                            IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, len(dns_mappings)))
+                    else:
+                        IO.ok('{}{}{} DNS queries for {} domains redirected.'.format(
+                            IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, len(dns_mappings)))
+
         for host in hosts:
             self.arp_spoofer.add(host)
             self.limiter.limit(host, direction, rate)
@@ -203,6 +245,36 @@ class MainMenu(CommandMenu):
         """
         hosts = self._get_hosts_by_ids(args.id)
         direction = self._parse_direction_args(args)
+
+        # Handle DNS redirection if specified
+        if args.dns is not None and hosts is not None and len(hosts) > 0:
+            # Initialize DNS spoofer if needed
+            if not self.dns_spoofer:
+                # Default redirect to gateway if no specific IP provided
+                self.dns_spoofer = DNSSpoofer(self.interface, self.gateway_ip)
+                self.dns_spoofer.start()
+                
+            if args.dns == "":
+                # No domains specified, redirect all DNS
+                for host in hosts:
+                    self.dns_spoofer.add(host)
+                    IO.ok('{}{}{} DNS queries redirected to gateway.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL))
+            else:
+                # Parse DNS arguments
+                dns_mappings = self._parse_dns_args(args.dns)
+                if dns_mappings is None:
+                    return
+                    
+                for host in hosts:
+                    self.dns_spoofer.add(host)
+                    self.dns_spoofer.set_domain_mapping(host.ip, dns_mappings)
+                    if isinstance(dns_mappings, dict):
+                        IO.ok('{}{}{} DNS mapping configured for {} domains.'.format(
+                            IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, len(dns_mappings)))
+                    else:
+                        IO.ok('{}{}{} DNS queries for {} domains redirected.'.format(
+                            IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, len(dns_mappings)))
 
         if hosts is not None and len(hosts) > 0:
             for host in hosts:
@@ -520,6 +592,61 @@ class MainMenu(CommandMenu):
         else:
             IO.error('{}{}{} is an invalid settings attribute.'.format(IO.Fore.LIGHTYELLOW_EX, args.attribute, IO.Style.RESET_ALL))
 
+    def _portal_handler(self, args):
+        """
+        Handles 'portal' command-line argument
+        Enables captive portal mode by redirecting DNS queries
+        """
+        action = args.action.lower()
+        
+        if action == 'enable':
+            hosts = self._get_hosts_by_ids(args.id)
+            if hosts is None or len(hosts) == 0:
+                return
+                
+            # Get redirect IP (default to gateway IP)
+            redirect_ip = args.redirect_ip if args.redirect_ip else self.gateway_ip
+            if not netutils.validate_ip_address(redirect_ip):
+                IO.error('invalid redirect IP address.')
+                return
+                
+            # Initialize DNS spoofer if not already done
+            if not self.dns_spoofer:
+                self.dns_spoofer = DNSSpoofer(self.interface, redirect_ip)
+                self.dns_spoofer.start()
+            else:
+                # Update redirect IP
+                self.dns_spoofer.redirect_ip = redirect_ip
+                
+            # Add hosts to DNS spoofer and ARP spoofer
+            for host in hosts:
+                if not host.spoofed:
+                    self.arp_spoofer.add(host)
+                self.dns_spoofer.add(host)
+                IO.ok('{}{}{} redirected to captive portal at {}{}{}.'.format(
+                    IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL,
+                    IO.Fore.LIGHTGREEN_EX, redirect_ip, IO.Style.RESET_ALL
+                ))
+                
+        elif action == 'disable':
+            hosts = self._get_hosts_by_ids(args.id)
+            if hosts is None or len(hosts) == 0:
+                return
+                
+            if not self.dns_spoofer:
+                IO.error('captive portal is not enabled.')
+                return
+                
+            # Remove hosts from DNS spoofer
+            for host in hosts:
+                self.dns_spoofer.remove(host)
+                IO.ok('{}{}{} removed from captive portal.'.format(
+                    IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL
+                ))
+                
+        else:
+            IO.error('invalid action. use "enable" or "disable".')
+
     def _reconnect_callback(self, old_host, new_host):
         """
         Callback that is called when a watched host reconnects
@@ -568,13 +695,19 @@ class MainMenu(CommandMenu):
 {s}contains host information, including IDs.
 
 {y}limit [ID1,ID2,...] [rate]{r}{}limits bandwith of host(s) (uload/dload).
-{y}      (--upload) (--download){r}{}{b}e.g.: limit 4 100kbit
+{y}      (--upload) (--download){r}{}
+{y}      (--dns [domains...]){r}{}{b}e.g.: limit 4 100kbit
 {s}      limit 2,3,4 1gbit --download
-{s}      limit all 200kbit --upload{r}
+{s}      limit all 200kbit --upload
+{s}      limit 2 100kbit --dns
+{s}      limit 3 50kbit --dns example.com mysite.com
+{s}      limit 4 1mbit --dns google.com=192.168.1.100{r}
 
 {y}block [ID1,ID2,...]{r}{}blocks internet access of host(s).
-{y}      (--upload) (--download){r}{}{b}e.g.: block 3,2
-{s}      block all --upload{r}
+{y}      (--upload) (--download){r}{}
+{y}      (--dns [domains...]){r}{}{b}e.g.: block 3,2
+{s}      block all --upload
+{s}      block 5 --dns facebook.com twitter.com{r}
 
 {y}free [ID1,ID2,...]{r}{}unlimits/unblocks host(s).
 {b}{s}e.g.: free 3
@@ -600,6 +733,11 @@ class MainMenu(CommandMenu):
 {y}watch set [attr] [value]{r}{}changes reconnect watch settings.
 {b}{s}e.g.: watch set interval 120{r}
 
+{y}portal [enable/disable] [ID1,ID2,...]{r}{}enables DNS redirection (captive portal).
+{y}       (--ip [redirect IP]){r}{}redirects all DNS queries to specified IP.
+{b}{s}e.g.: portal enable 3,4 --ip 192.168.1.100
+{s}      portal disable all{r}
+
 {y}clear{r}{}clears the terminal window.
 
 {y}quit{r}{}quits the application.
@@ -608,8 +746,10 @@ class MainMenu(CommandMenu):
                     spaces[len('hosts (--force)'):],
                     spaces[len('limit [ID1,ID2,...] [rate]'):],
                     spaces[len('      (--upload) (--download)'):],
+                    spaces[len('      (--dns [domains...])'):],
                     spaces[len('block [ID1,ID2,...]'):],
                     spaces[len('      (--upload) (--download)'):],
+                    spaces[len('      (--dns [domains...])'):],
                     spaces[len('free [ID1,ID2,...]'):],
                     spaces[len('add [IP] (--mac [MAC])'):],
                     spaces[len('monitor (--interval [time in ms])'):],
@@ -619,6 +759,8 @@ class MainMenu(CommandMenu):
                     spaces[len('watch add [ID1,ID2,...]'):],
                     spaces[len('watch remove [ID1,ID2,...]'):],
                     spaces[len('watch set [attr] [value]'):],
+                    spaces[len('portal [enable/disable] [ID1,ID2,...]'):],
+                    spaces[len('       (--ip [redirect IP])'):],
                     spaces[len('clear'):],
                     spaces[len('quit'):],
                     y=IO.Fore.LIGHTYELLOW_EX, r=IO.Style.RESET_ALL, b=IO.Style.BRIGHT,
@@ -696,6 +838,56 @@ class MainMenu(CommandMenu):
 
         return Direction.BOTH if direction == Direction.NONE else direction
 
+    def _parse_dns_args(self, dns_args):
+        """
+        Parse DNS arguments to create domain mappings
+        Supports formats:
+        - Single domain: 'example.com' -> redirect to default IP
+        - Multiple domains: 'example.com test.com' -> redirect to default IP
+        - Domain with IP: 'example.com=192.168.1.100' -> specific redirect
+        - Mixed: 'example.com test.com=192.168.1.200'
+        """
+        if not dns_args:
+            return []
+            
+        # Split the string into individual arguments
+        args_list = dns_args.split()
+        
+        mappings = {}
+        domains_only = []
+        
+        for arg in args_list:
+            if '=' in arg:
+                # Domain with specific IP mapping
+                parts = arg.split('=', 1)
+                domain = parts[0].strip()
+                ip = parts[1].strip()
+                
+                # Validate IP
+                if not netutils.validate_ip_address(ip):
+                    # Try to resolve domain name to IP
+                    resolved_ip = self.dns_spoofer._resolve_domain(ip) if self.dns_spoofer else None
+                    if resolved_ip:
+                        ip = resolved_ip
+                    else:
+                        IO.error('invalid IP address or unresolvable domain: {}'.format(ip))
+                        return None
+                        
+                mappings[domain] = ip
+            else:
+                # Domain only, use default redirect IP
+                domains_only.append(arg.strip())
+                
+        # If we have domains without specific IPs, return as list
+        if domains_only and not mappings:
+            return domains_only
+        elif domains_only:
+            # Mix of both - add domains_only with default IP
+            for domain in domains_only:
+                mappings[domain] = self.dns_spoofer.redirect_ip if self.dns_spoofer else self.gateway_ip
+                
+        return mappings if mappings else domains_only
+
     def _parse_iprange(self, range):
         try:
             if '-' in range:
@@ -714,3 +906,7 @@ class MainMenu(CommandMenu):
             self.limiter.unlimit(host, Direction.BOTH)
             self.bandwidth_monitor.remove(host)
             self.host_watcher.remove(host)
+            
+            # Also remove from DNS spoofer if active
+            if self.dns_spoofer:
+                self.dns_spoofer.remove(host)

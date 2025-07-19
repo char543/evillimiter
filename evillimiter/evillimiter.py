@@ -44,6 +44,10 @@ def is_linux():
     return platform.system() == 'Linux'
 
 
+def is_macos():
+    return platform.system() == 'Darwin'
+
+
 def parse_arguments():
     """
     Parses the main command-line arguments (sys.argv)
@@ -156,8 +160,8 @@ def run():
     IO.initialize(args.colorless)
     IO.print(get_main_banner(version))
 
-    if not is_linux():
-        IO.error('run under linux.')
+    if not is_linux() and not is_macos():
+        IO.error('run under linux or macOS.')
         return
 
     if not is_privileged():

