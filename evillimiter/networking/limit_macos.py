@@ -19,6 +19,7 @@ class MacOSLimiter(object):
         self._host_dict = {}
         self._host_dict_lock = threading.Lock()
         self._rules_file = None
+        self._active_rules = []  # Keep track of all active rules
 
     def limit(self, host, direction, rate):
         """
@@ -29,9 +30,16 @@ class MacOSLimiter(object):
 
         # Create dummynet pipes for bandwidth limiting
         if (direction & Direction.OUTGOING) == Direction.OUTGOING:
-            shell.execute_suppressed('{} pipe {} config bw {}'.format(BIN_DNCTL, host_ids.upload_id, rate))
+            # Convert rate to kbps format for dnctl
+            rate_kbps = rate.rate // 1000  # Convert bits to kbps
+            result = shell.execute_suppressed('{} pipe {} config bw {}Kbit/s'.format(BIN_DNCTL, host_ids.upload_id, rate_kbps))
+            if result != 0:
+                print(f"Warning: Failed to create upload pipe {host_ids.upload_id}")
         if (direction & Direction.INCOMING) == Direction.INCOMING:
-            shell.execute_suppressed('{} pipe {} config bw {}'.format(BIN_DNCTL, host_ids.download_id, rate))
+            rate_kbps = rate.rate // 1000  # Convert bits to kbps  
+            result = shell.execute_suppressed('{} pipe {} config bw {}Kbit/s'.format(BIN_DNCTL, host_ids.download_id, rate_kbps))
+            if result != 0:
+                print(f"Warning: Failed to create download pipe {host_ids.download_id}")
 
         # Generate and load pfctl rules
         self._generate_pfctl_rules(host, direction, host_ids, rate)
@@ -69,8 +77,9 @@ class MacOSLimiter(object):
 
             del self._host_dict[host]
 
-        # Regenerate pfctl rules without this host
-        self._regenerate_pfctl_rules()
+        # Remove rules for this host and regenerate
+        self._remove_host_rules(host, direction)
+        self._load_all_pfctl_rules()
 
         host.limited = False
         host.blocked = False
@@ -138,35 +147,42 @@ class MacOSLimiter(object):
         """
         Generates pfctl rules for bandwidth limiting
         """
-        rules = []
+        new_rules = []
         
         if (direction & Direction.OUTGOING) == Direction.OUTGOING:
-            rules.append('pass out quick on {} from {} to any dnpipe {}'.format(
-                self.interface, host.ip, host_ids.upload_id))
+            # For upload limiting, match packets from the host
+            rule = 'dummynet out quick on {} inet from {} to any pipe {}'.format(
+                self.interface, host.ip, host_ids.upload_id)
+            new_rules.append(rule)
+            self._active_rules.append(rule)
         if (direction & Direction.INCOMING) == Direction.INCOMING:
-            rules.append('pass in quick on {} from any to {} dnpipe {}'.format(
-                self.interface, host.ip, host_ids.download_id))
+            # For download limiting, match packets to the host
+            rule = 'dummynet in quick on {} inet from any to {} pipe {}'.format(
+                self.interface, host.ip, host_ids.download_id)
+            new_rules.append(rule)
+            self._active_rules.append(rule)
         
-        self._load_pfctl_rules(rules)
+        self._load_all_pfctl_rules()
 
     def _generate_pfctl_blocking_rules(self, host, direction):
         """
         Generates pfctl rules for blocking traffic
         """
-        rules = []
-        
         if (direction & Direction.OUTGOING) == Direction.OUTGOING:
-            rules.append('block out quick on {} from {}'.format(self.interface, host.ip))
+            rule = 'block out quick on {} from {}'.format(self.interface, host.ip)
+            self._active_rules.append(rule)
         if (direction & Direction.INCOMING) == Direction.INCOMING:
-            rules.append('block in quick on {} to {}'.format(self.interface, host.ip))
+            rule = 'block in quick on {} to {}'.format(self.interface, host.ip)
+            self._active_rules.append(rule)
         
-        self._load_pfctl_rules(rules)
+        self._load_all_pfctl_rules()
 
     def _regenerate_pfctl_rules(self):
         """
         Regenerates all pfctl rules for currently limited/blocked hosts
         """
-        rules = []
+        # Clear existing rules and rebuild from host dict
+        self._active_rules = []
         
         with self._host_dict_lock:
             for host, info in self._host_dict.items():
@@ -176,34 +192,59 @@ class MacOSLimiter(object):
                 
                 if rate is None:  # Blocked host
                     if (direction & Direction.OUTGOING) == Direction.OUTGOING:
-                        rules.append('block out quick on {} from {}'.format(self.interface, host.ip))
+                        self._active_rules.append('block out quick on {} from {}'.format(self.interface, host.ip))
                     if (direction & Direction.INCOMING) == Direction.INCOMING:
-                        rules.append('block in quick on {} to {}'.format(self.interface, host.ip))
+                        self._active_rules.append('block in quick on {} to {}'.format(self.interface, host.ip))
                 else:  # Limited host
                     if (direction & Direction.OUTGOING) == Direction.OUTGOING:
-                        rules.append('pass out quick on {} from {} to any dnpipe {}'.format(
+                        self._active_rules.append('pass out quick on {} inet from {} to any dnpipe {}'.format(
                             self.interface, host.ip, host_ids.upload_id))
                     if (direction & Direction.INCOMING) == Direction.INCOMING:
-                        rules.append('pass in quick on {} from any to {} dnpipe {}'.format(
+                        self._active_rules.append('pass in quick on {} inet from any to {} dnpipe {}'.format(
                             self.interface, host.ip, host_ids.download_id))
         
-        self._load_pfctl_rules(rules)
+        self._load_all_pfctl_rules()
 
-    def _load_pfctl_rules(self, rules):
+    def _load_all_pfctl_rules(self):
         """
-        Loads pfctl rules from a list
+        Loads all accumulated pfctl rules
         """
         # Create temporary rules file
         if self._rules_file is None:
             fd, self._rules_file = tempfile.mkstemp(suffix='.pf', text=True)
             os.close(fd)
         
+        # Debug: print what we're writing
+        print(f"DEBUG: Writing {len(self._active_rules)} rules to {self._rules_file}")
+        for rule in self._active_rules:
+            print(f"DEBUG: Rule: {rule}")
+        
         with open(self._rules_file, 'w') as f:
-            f.write('\n'.join(rules))
+            # Write all active rules
+            f.write('\n'.join(self._active_rules))
             f.write('\n')
         
+        # Also save a copy for debugging
+        debug_file = '/tmp/evillimiter_debug.pf'
+        with open(debug_file, 'w') as f:
+            f.write('\n'.join(self._active_rules))
+            f.write('\n')
+        print(f"DEBUG: Rules also saved to {debug_file}")
+        
+        # Ensure pfctl is enabled before loading rules
+        shell.execute_suppressed('{} -e'.format(BIN_PFCTL))
+        
         # Load the rules
-        shell.execute_suppressed('{} -f {}'.format(BIN_PFCTL, self._rules_file))
+        result = shell.execute_suppressed('{} -f {}'.format(BIN_PFCTL, self._rules_file))
+        print(f"DEBUG: pfctl -f result: {result}")
+
+    def _remove_host_rules(self, host, direction):
+        """
+        Remove rules for a specific host
+        """
+        # Filter out rules for this host
+        self._active_rules = [rule for rule in self._active_rules 
+                            if not (host.ip in rule and self.interface in rule)]
 
     def cleanup(self):
         """

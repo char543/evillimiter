@@ -80,13 +80,28 @@ def flush_network_settings(interface):
         shell.execute_suppressed('{} qdisc del dev {} root'.format(BIN_TC, interface))
     elif IS_MACOS:
         # Flush pfctl rules
-        shell.execute_suppressed('{} -F all'.format(BIN_PFCTL))
+        shell.execute_suppressed('{} -F all 2>/dev/null'.format(BIN_PFCTL))
         
-        # Delete all dummynet pipes
-        shell.execute_suppressed('{} pipe flush'.format(BIN_DNCTL))
+        # Delete all dummynet pipes - use list first to avoid hanging
+        try:
+            # Get list of pipes
+            import subprocess
+            result = subprocess.run([BIN_DNCTL, 'list'], capture_output=True, text=True, timeout=2)
+            # Delete each pipe individually
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                for line in lines:
+                    if line.strip() and 'pipe' in line:
+                        # Extract pipe number
+                        parts = line.split()
+                        if len(parts) > 1:
+                            pipe_num = parts[1]
+                            shell.execute_suppressed('{} pipe delete {}'.format(BIN_DNCTL, pipe_num))
+        except:
+            pass
         
         # Reset pfctl
-        shell.execute_suppressed('{} -d'.format(BIN_PFCTL))
+        shell.execute_suppressed('{} -d 2>/dev/null'.format(BIN_PFCTL))
 
 
 def validate_ip_address(ip):
@@ -104,8 +119,10 @@ def create_qdisc_root(interface):
     if IS_LINUX:
         return shell.execute_suppressed('{} qdisc add dev {} root handle 1:0 htb'.format(BIN_TC, interface)) == 0
     elif IS_MACOS:
-        # Enable pfctl on macOS
-        return shell.execute_suppressed('{} -e'.format(BIN_PFCTL)) == 0
+        # Enable pfctl - this is what we need for traffic control on macOS
+        result = shell.execute_suppressed('{} -e 2>/dev/null'.format(BIN_PFCTL))
+        # pfctl returns 1 if already enabled, 0 if newly enabled - both are success
+        return result == 0 or result == 1
 
 
 def delete_qdisc_root(interface):
