@@ -6,6 +6,7 @@ import warnings
 import evillimiter.console.shell as shell
 from .host import Host
 from evillimiter.common.globals import BIN_PFCTL, BIN_DNCTL
+from .transparent_proxy import TransparentProxy
 
 
 class MacOSLimiter(object):
@@ -20,6 +21,9 @@ class MacOSLimiter(object):
         self._host_dict_lock = threading.Lock()
         self._rules_file = None
         self._active_rules = []  # Keep track of all active rules
+        self._dns_rules = {}  # Keep track of DNS redirect rules per host
+        self.proxy = TransparentProxy(interface=interface, port=8080)
+        self.proxy.start()
 
     def limit(self, host, direction, rate):
         """
@@ -164,6 +168,23 @@ class MacOSLimiter(object):
         
         self._load_all_pfctl_rules()
 
+    def _generate_dns_redirect_rules(self, host, redirect_ip):
+        """
+        Generates pfctl NAT rules for DNS redirection to our DNS server
+        """
+        # Redirect DNS queries regardless of destination DNS server
+        # Use 'pass' to ensure the rule matches
+        dns_nat_udp = 'rdr pass on {} inet proto udp from {} to any port 53 -> {} port 5354'.format(
+            self.interface, host.ip, redirect_ip)
+        dns_nat_tcp = 'rdr pass on {} inet proto tcp from {} to any port 53 -> {} port 5354'.format(
+            self.interface, host.ip, redirect_ip)
+        
+        # Store DNS rules separately so they persist
+        self._dns_rules[host.ip] = [dns_nat_udp, dns_nat_tcp]
+        
+        # Load all rules including NAT
+        self._load_all_rules()
+
     def _generate_pfctl_blocking_rules(self, host, direction):
         """
         Generates pfctl rules for blocking traffic
@@ -197,10 +218,10 @@ class MacOSLimiter(object):
                         self._active_rules.append('block in quick on {} to {}'.format(self.interface, host.ip))
                 else:  # Limited host
                     if (direction & Direction.OUTGOING) == Direction.OUTGOING:
-                        self._active_rules.append('pass out quick on {} inet from {} to any dnpipe {}'.format(
+                        self._active_rules.append('dummynet out quick on {} inet from {} to any pipe {}'.format(
                             self.interface, host.ip, host_ids.upload_id))
                     if (direction & Direction.INCOMING) == Direction.INCOMING:
-                        self._active_rules.append('pass in quick on {} inet from any to {} dnpipe {}'.format(
+                        self._active_rules.append('dummynet in quick on {} inet from any to {} pipe {}'.format(
                             self.interface, host.ip, host_ids.download_id))
         
         self._load_all_pfctl_rules()
@@ -214,14 +235,21 @@ class MacOSLimiter(object):
             fd, self._rules_file = tempfile.mkstemp(suffix='.pf', text=True)
             os.close(fd)
         
+        # Combine DNS rules and active rules
+        all_dns_rules = []
+        for host_ip, rules in self._dns_rules.items():
+            all_dns_rules.extend(rules)
+        
+        all_rules = all_dns_rules + self._active_rules
+        
         # Debug: print what we're writing
-        print(f"DEBUG: Writing {len(self._active_rules)} rules to {self._rules_file}")
-        for rule in self._active_rules:
+        print(f"DEBUG: Writing {len(all_rules)} rules to {self._rules_file}")
+        for rule in all_rules:
             print(f"DEBUG: Rule: {rule}")
         
         with open(self._rules_file, 'w') as f:
-            # Write all active rules
-            f.write('\n'.join(self._active_rules))
+            # Write all rules (DNS rules first, then active rules)
+            f.write('\n'.join(all_rules))
             f.write('\n')
         
         # Also save a copy for debugging
@@ -234,9 +262,50 @@ class MacOSLimiter(object):
         # Ensure pfctl is enabled before loading rules
         shell.execute_suppressed('{} -e'.format(BIN_PFCTL))
         
-        # Load the rules
+        # Load the filter rules
         result = shell.execute_suppressed('{} -f {}'.format(BIN_PFCTL, self._rules_file))
         print(f"DEBUG: pfctl -f result: {result}")
+    
+    def _load_all_rules(self):
+        """
+        Loads both filter and NAT rules for pfctl
+        """
+        # First load filter rules
+        self._load_all_pfctl_rules()
+        
+        # Then load NAT rules if any
+        if self._dns_rules:
+            # Create temporary file with both NAT and filter rules
+            fd, combined_file = tempfile.mkstemp(suffix='.pf', text=True)
+            os.close(fd)
+            
+            with open(combined_file, 'w') as f:
+                # Write NAT rules first (separate section)
+                for rules in self._dns_rules.values():
+                    f.write('\n'.join(rules))
+                    f.write('\n')
+                
+                # Then write filter rules
+                if self._active_rules:
+                    f.write('\n'.join(self._active_rules))
+                    f.write('\n')
+            
+            # Enable pfctl if not already enabled
+            shell.execute_suppressed('{} -e'.format(BIN_PFCTL))
+            
+            # Load NAT rules first with -N flag
+            result_nat = shell.execute_suppressed('{} -N -f {}'.format(BIN_PFCTL, combined_file))
+            # Then load filter rules with -R flag  
+            result_filter = shell.execute_suppressed('{} -R -f {}'.format(BIN_PFCTL, combined_file))
+            print(f"DEBUG: pfctl NAT result: {result_nat}, filter result: {result_filter}")
+            
+            # Debug: show what was loaded
+            with open(combined_file, 'r') as f:
+                print(f"DEBUG: Combined rules file contents:")
+                print(f.read())
+            
+            # Clean up
+            os.unlink(combined_file)
 
     def _remove_host_rules(self, host, direction):
         """
@@ -245,6 +314,18 @@ class MacOSLimiter(object):
         # Filter out rules for this host
         self._active_rules = [rule for rule in self._active_rules 
                             if not (host.ip in rule and self.interface in rule)]
+        
+        # Also remove DNS rules for this host
+        if host.ip in self._dns_rules:
+            del self._dns_rules[host.ip]
+
+    def setup_proxy_redirect(self, host):
+        """Setup transparent proxy redirection for a host"""
+        self.proxy.setup_redirection(host.ip)
+
+    def remove_proxy_redirect(self, host):
+        """Remove transparent proxy redirection for a host"""
+        self.proxy.remove_redirection(host.ip)
 
     def cleanup(self):
         """

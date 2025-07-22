@@ -21,14 +21,16 @@ EvilLimiter has been updated to support macOS alongside Linux. The macOS impleme
 ## Installation
 
 1. **Install python, pip & dependencies:**
+
    ```bash
    brew install python pipx
    pipx ensurepath
    ```
 
-3. **Install the package:**
+2. **Install the package:**
 
    Clone the repo then:
+
    ```bash
    cd evillimiter
    pipx install .

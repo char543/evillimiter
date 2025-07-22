@@ -74,13 +74,21 @@ class DNSSpoofer(object):
         while self._running:
             try:
                 # Sniff DNS packets for a short interval
-                packets = sniff(filter="udp port 53", 
-                              prn=self._process_dns_packet,
-                              timeout=1,
-                              iface=self.interface,
-                              store=0)
-            except Exception:
-                # Continue on error
+                # On macOS, don't specify interface for better compatibility
+                if platform.system() == 'Darwin':
+                    packets = sniff(filter="udp port 53", 
+                                  prn=self._process_dns_packet,
+                                  timeout=1,
+                                  store=0)
+                else:
+                    packets = sniff(filter="udp port 53", 
+                                  prn=self._process_dns_packet,
+                                  timeout=1,
+                                  iface=self.interface,
+                                  store=0)
+            except Exception as e:
+                # Print error for debugging
+                print(f"DNS sniff error: {e}")
                 pass
                 
     def _process_dns_packet(self, packet):
@@ -95,10 +103,16 @@ class DNSSpoofer(object):
         if not src_ip:
             return
             
+        # Debug: print DNS packets we see
+        print(f"DEBUG: DNS packet from {src_ip}")
+            
         with self._hosts_lock:
             host_found = any(host.ip == src_ip for host in self._hosts)
             if not host_found:
+                print(f"DEBUG: {src_ip} not in target hosts")
                 return
+            
+        print(f"DEBUG: Processing DNS from target {src_ip}")
                 
         # Only process DNS queries
         if packet.haslayer(DNS) and packet[DNS].qr == 0:

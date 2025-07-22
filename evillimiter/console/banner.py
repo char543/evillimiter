@@ -8,7 +8,8 @@ _MAIN_BANNER = r"""{}
 ██╔══╝  ╚██╗ ██╔╝██║██║       ██║     ██║██║╚██╔╝██║██║   ██║   ██╔══╝  ██╔══██╗
 ███████╗ ╚████╔╝ ██║███████╗  ███████╗██║██║ ╚═╝ ██║██║   ██║   ███████╗██║  ██║
 ╚══════╝  ╚═══╝  ╚═╝╚══════╝  ╚══════╝╚═╝╚═╝     ╚═╝╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
-                {}by bitbrute  ~  limit devices on your network :3
+            {} Original by bitbrute \ Modded with ♥️  by borisjohnson 
+             ~ limit, block and redirect devices on your network :3
                                     v[_V_]
 
 """.format(IO.Fore.LIGHTRED_EX, IO.Style.RESET_ALL + IO.Style.BRIGHT)
