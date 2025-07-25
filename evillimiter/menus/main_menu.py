@@ -2,6 +2,7 @@ import time
 import socket
 import curses
 import netaddr
+import netifaces
 import threading
 import collections
 from terminaltables import SingleTable
@@ -38,13 +39,11 @@ class MainMenu(CommandMenu):
         limit_parser.add_parameter('rate')
         limit_parser.add_flag('--upload', 'upload')
         limit_parser.add_flag('--download', 'download')
-        limit_parser.add_parameterized_flag('--dns', 'dns')
 
         block_parser = self.parser.add_subparser('block', self._block_handler)
         block_parser.add_parameter('id')
         block_parser.add_flag('--upload', 'upload')
         block_parser.add_flag('--download', 'download')
-        block_parser.add_parameterized_flag('--dns', 'dns')
 
         free_parser = self.parser.add_subparser('free', self._free_handler)
         free_parser.add_parameter('id')
@@ -69,15 +68,11 @@ class MainMenu(CommandMenu):
         watch_set_parser.add_parameter('attribute')
         watch_set_parser.add_parameter('value')
 
-        portal_parser = self.parser.add_subparser('portal', self._portal_handler)
-        portal_parser.add_parameter('action')
-        portal_parser.add_parameter('id')
-        portal_parser.add_parameterized_flag('--ip', 'redirect_ip')
-
-        # Add new command for proxy redirection
+        # Unified redirect command with all options
         redirect_parser = self.parser.add_subparser('redirect', self._redirect_handler)
         redirect_parser.add_parameter('id')
-        redirect_parser.add_parameterized_flag('--to', 'target_url')
+        redirect_parser.add_parameterized_flag('--to', 'to')
+        redirect_parser.add_parameterized_flag('--dns', 'dns')
 
         self.parser.add_subparser('help', self._help_handler)
         self.parser.add_subparser('?', self._help_handler)
@@ -134,13 +129,23 @@ class MainMenu(CommandMenu):
         Handles 'scan' command-line argument
         (Re)scans for hosts on the network
         """
-        if args.iprange:
-            iprange = self._parse_iprange(args.iprange)
-            if iprange is None:
-                IO.error('invalid ip range.')
-                return
-        else:
-            iprange = None
+        try:
+            if args.iprange is not None:
+                iprange = self._parse_iprange(args.iprange)
+                if iprange is None:
+                    IO.error('invalid ip range.')
+                    return
+            else:
+                # Get IP range from interface configuration
+                try:
+                    netmask = netifaces.ifaddresses(self.interface)[netifaces.AF_INET][0]['netmask']
+                except (ValueError, KeyError):
+                    netmask = '255.255.255.0'
+                
+                iprange = netutils.get_ip_range(self.gateway_ip, netmask)
+        except Exception as e:
+            IO.error(f"Error determining IP range: {e}")
+            return
 
         with self.hosts_lock:
             for host in self.hosts:
@@ -206,57 +211,14 @@ class MainMenu(CommandMenu):
 
         direction = self._parse_direction_args(args)
 
-        # Handle DNS redirection if specified
-        if args.dns is not None:
-            # Initialize DNS server if needed
-            if not self.dns_server:
-                self.dns_server = SimpleDNSServer()
-                self.dns_server.set_redirect_ip(self.gateway_ip)
-                self.dns_server.start()
-                
-            if args.dns == "":
-                # No domains specified, redirect all DNS
-                for host in hosts:
-                    # Add pfctl rule to redirect DNS traffic from this host
-                    # Get our interface IP address
-                    import netifaces
-                    addrs = netifaces.ifaddresses(self.interface)
-                    our_ip = addrs[netifaces.AF_INET][0]['addr']
-                    self.limiter._generate_dns_redirect_rules(host, our_ip)
-                    IO.ok('{}{}{} DNS queries redirected to gateway.'.format(
-                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL))
-            else:
-                # Parse DNS arguments
-                dns_mappings = self._parse_dns_args(args.dns)
-                if dns_mappings is None:
-                    return
-                    
-                for host in hosts:
-                    # Add pfctl rule to redirect DNS traffic from this host
-                    # Get our interface IP address
-                    import netifaces
-                    addrs = netifaces.ifaddresses(self.interface)
-                    our_ip = addrs[netifaces.AF_INET][0]['addr']
-                    self.limiter._generate_dns_redirect_rules(host, our_ip)
-                    
-                    # Configure domain mappings in DNS server
-                    if isinstance(dns_mappings, dict):
-                        for domain, ip in dns_mappings.items():
-                            self.dns_server.add_domain_mapping(domain, ip)
-                        IO.ok('{}{}{} DNS mapping configured for {} domains.'.format(
-                            IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, len(dns_mappings)))
-                    else:
-                        for domain in dns_mappings:
-                            self.dns_server.add_domain_mapping(domain, self.gateway_ip)
-                        IO.ok('{}{}{} DNS queries for {} domains redirected.'.format(
-                            IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, len(dns_mappings)))
-
         for host in hosts:
             self.arp_spoofer.add(host)
             self.limiter.limit(host, direction, rate)
             self.bandwidth_monitor.add(host)
 
-            IO.ok('{}{}{r} {} {}limited{r} to {}.'.format(IO.Fore.LIGHTYELLOW_EX, host.ip, Direction.pretty_direction(direction), IO.Fore.LIGHTRED_EX, rate, r=IO.Style.RESET_ALL))
+            IO.ok('{}{}{r} {} {}limited{r} to {}.'.format(
+                IO.Fore.LIGHTYELLOW_EX, host.ip, Direction.pretty_direction(direction),
+                IO.Fore.LIGHTRED_EX, rate, r=IO.Style.RESET_ALL))
 
     def _block_handler(self, args):
         """
@@ -266,51 +228,6 @@ class MainMenu(CommandMenu):
         hosts = self._get_hosts_by_ids(args.id)
         direction = self._parse_direction_args(args)
 
-        # Handle DNS redirection if specified
-        if args.dns is not None and hosts is not None and len(hosts) > 0:
-            # Initialize DNS server if needed
-            if not self.dns_server:
-                self.dns_server = SimpleDNSServer()
-                self.dns_server.set_redirect_ip(self.gateway_ip)
-                self.dns_server.start()
-                
-            if args.dns == "":
-                # No domains specified, redirect all DNS
-                for host in hosts:
-                    # Add pfctl rule to redirect DNS traffic from this host
-                    # Get our interface IP address
-                    import netifaces
-                    addrs = netifaces.ifaddresses(self.interface)
-                    our_ip = addrs[netifaces.AF_INET][0]['addr']
-                    self.limiter._generate_dns_redirect_rules(host, our_ip)
-                    IO.ok('{}{}{} DNS queries redirected to gateway.'.format(
-                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL))
-            else:
-                # Parse DNS arguments
-                dns_mappings = self._parse_dns_args(args.dns)
-                if dns_mappings is None:
-                    return
-                    
-                for host in hosts:
-                    # Add pfctl rule to redirect DNS traffic from this host
-                    # Get our interface IP address
-                    import netifaces
-                    addrs = netifaces.ifaddresses(self.interface)
-                    our_ip = addrs[netifaces.AF_INET][0]['addr']
-                    self.limiter._generate_dns_redirect_rules(host, our_ip)
-                    
-                    # Configure domain mappings in DNS server
-                    if isinstance(dns_mappings, dict):
-                        for domain, ip in dns_mappings.items():
-                            self.dns_server.add_domain_mapping(domain, ip)
-                        IO.ok('{}{}{} DNS mapping configured for {} domains.'.format(
-                            IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, len(dns_mappings)))
-                    else:
-                        for domain in dns_mappings:
-                            self.dns_server.add_domain_mapping(domain, self.gateway_ip)
-                        IO.ok('{}{}{} DNS queries for {} domains redirected.'.format(
-                            IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, len(dns_mappings)))
-
         if hosts is not None and len(hosts) > 0:
             for host in hosts:
                 if not host.spoofed:
@@ -318,7 +235,10 @@ class MainMenu(CommandMenu):
 
                 self.limiter.block(host, direction)
                 self.bandwidth_monitor.add(host)
-                IO.ok('{}{}{r} {} {}blocked{r}.'.format(IO.Fore.LIGHTYELLOW_EX, host.ip, Direction.pretty_direction(direction), IO.Fore.RED, r=IO.Style.RESET_ALL))
+                IO.ok('{}{}{r} {} {}blocked{r}.'.format(
+                    IO.Fore.LIGHTYELLOW_EX, host.ip,
+                    Direction.pretty_direction(direction),
+                    IO.Fore.RED, r=IO.Style.RESET_ALL))
 
     def _free_handler(self, args):
         """
@@ -629,8 +549,8 @@ class MainMenu(CommandMenu):
 
     def _portal_handler(self, args):
         """
-        Handles 'portal' command-line argument
-        Enables captive portal mode by redirecting DNS queries
+        DEPRECATED: Use 'redirect' command instead.
+        This will be removed in a future version.
         """
         action = args.action.lower()
         
@@ -685,23 +605,94 @@ class MainMenu(CommandMenu):
             IO.error('invalid action. use "enable" or "disable".')
 
     def _redirect_handler(self, args):
-        """Handle redirect command"""
+        """Handle redirect command with options:
+        redirect <id>                          # Default: redirect to local proxy
+        redirect <id> --to <ip|domain>        # Redirect all traffic to IP or domain
+        redirect <id> --dns <domain>=<ip>     # Domain-specific redirection
+        """
         hosts = self._get_hosts_by_ids(args.id)
         if hosts is None or len(hosts) == 0:
             return
             
+        # Parse arguments
+        target_ip = None
+        dns_mappings = None
+        
+        if hasattr(args, 'to') and args.to:
+            target = args.to
+            # Clean up the target (remove http://, https://, trailing slashes)
+            target = target.lower()
+            target = target.replace('http://', '').replace('https://', '')
+            target = target.split('/')[0]  # Remove paths
+            
+            if netutils.validate_ip_address(target):
+                target_ip = target
+            else:
+                # It's a domain, try to resolve it
+                try:
+                    addr_info = socket.getaddrinfo(target, None)
+                    target_ip = addr_info[0][4][0]  # Get first IPv4 address
+                except (socket.gaierror, IndexError):
+                    IO.error(f'Could not resolve domain: {target}')
+                    return
+            
+        if hasattr(args, 'dns') and args.dns:
+            try:
+                domain, ip = args.dns.split('=')
+                if not netutils.validate_ip_address(ip):
+                    IO.error('Invalid DNS mapping IP address')
+                    return
+                dns_mappings = {domain: ip}
+            except ValueError:
+                IO.error("Invalid --dns format. Use: --dns domain=ip")
+                return
+
+        # Initialize DNS server if needed (with proper interface)
+        if not self.dns_server:
+            self.dns_server = SimpleDNSServer(interface=self.interface, port=5354)
+            try:
+                self.dns_server.start()
+            except Exception as e:
+                IO.error(f'Failed to start DNS server: {e}')
+                return
+
         for host in hosts:
             if not host.spoofed:
                 self.arp_spoofer.add(host)
-                
-            # Setup proxy redirection
-            self.limiter.setup_proxy_redirect(host)
             
-            # Add redirect rule if target specified
-            if args.target_url:
-                self.limiter.proxy.add_redirect(host.ip, args.target_url)
+            try:
+                # Get local interface IP for redirection
+                try:
+                    local_ip = netutils.get_local_ip_address(self.interface)
+                except Exception:
+                    local_ip = '127.0.0.1'  # Fallback to localhost if can't get interface IP
                 
-            IO.ok(f'{IO.Fore.LIGHTYELLOW_EX}{host.ip}{IO.Style.RESET_ALL} redirected')
+                # Configure DNS server first
+                if dns_mappings:
+                    for domain, ip in dns_mappings.items():
+                        self.dns_server.add_domain_mapping(domain, ip)
+                elif target_ip:
+                    self.dns_server.set_redirect_ip(target_ip)
+                else:
+                    self.dns_server.set_redirect_ip(local_ip)
+                
+                # Now set up the proxy redirection
+                self.limiter.proxy.setup_redirection(host.ip, target_ip, dns_mappings)
+                
+                if target_ip:
+                    msg = f"{args.to} ({target_ip})" if target_ip != args.to else target_ip
+                    IO.ok('{}{}{} redirected to {}.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, msg))
+                elif dns_mappings:
+                    domain = list(dns_mappings.keys())[0]
+                    ip = dns_mappings[domain]
+                    IO.ok('{}{}{} DNS mapping: {} -> {}'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, domain, ip))
+                else:
+                    IO.ok('{}{}{} redirected to local proxy.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL))
+            except Exception as e:
+                IO.error(f'Failed to set up redirection for {host.ip}: {e}')
 
     def _reconnect_callback(self, old_host, new_host):
         """
@@ -750,87 +741,79 @@ class MainMenu(CommandMenu):
 {y}hosts (--force){r}{}lists all scanned hosts.
 {s}contains host information, including IDs.
 
-{y}limit [ID1,ID2,...] [rate]{r}{}limits bandwith of host(s) (uload/dload).
+{y}limit [ID1,ID2,...] [rate]{r}{}limits bandwidth of host(s).
 {y}      (--upload) (--download){r}{}
-{y}      (--dns [domains...]){r}{}{b}e.g.: limit 4 100kbit
+{b}{s}e.g.: limit 4 100kbit
 {s}      limit 2,3,4 1gbit --download
-{s}      limit all 200kbit --upload
-{s}      limit 2 100kbit --dns
-{s}      limit 3 50kbit --dns example.com mysite.com
-{s}      limit 4 1mbit --dns google.com=192.168.1.100{r}
+{s}      limit all 200kbit --upload{r}
 
 {y}block [ID1,ID2,...]{r}{}blocks internet access of host(s).
 {y}      (--upload) (--download){r}{}
-{y}      (--dns [domains...]){r}{}{b}e.g.: block 3,2
-{s}      block all --upload
-{s}      block 5 --dns facebook.com twitter.com{r}
+{b}{s}e.g.: block 2
+{s}      block 1,2 --upload
+{s}      block all --download{r}
 
-{y}free [ID1,ID2,...]{r}{}unlimits/unblocks host(s).
-{b}{s}e.g.: free 3
-{s}      free all{r}
+{y}redirect [ID1,ID2,...]{r}{}redirects traffic through local proxy.
+{y}       (--to [IP|domain]){r}{}redirects all traffic to specified target.
+{y}       (--dns [domain=IP]){r}{}maps specific domain to IP address.
+{b}{s}e.g.: redirect 2
+{s}      redirect 3 --to 192.168.1.100
+{s}      redirect 4 --to example.com
+{s}      redirect 2 --dns google.com=192.168.1.100{r}
 
 {y}add [IP] (--mac [MAC]){r}{}adds custom host to host list.
 {s}mac resolved automatically.
 {b}{s}e.g.: add 192.168.178.24
 {s}      add 192.168.1.50 --mac 1c:fc:bc:2d:a6:37{r}
 
-{y}monitor (--interval [time in ms]){r}{}monitors bandwidth usage of limited host(s).
-{b}{s}e.g.: monitor --interval 600{r}
+{y}free [ID1,ID2,...]{r}{}removes any restrictions from host(s).
+{b}{s}e.g.: free 3,4
+{s}      free all{r}
 
-{y}analyze [ID1,ID2,...]{r}{}analyzes traffic of host(s) without limiting
-{y}        (--duration [time in s]){r}{}to determine who uses how much bandwidth.
-{b}{s}e.g.: analyze 2,3 --duration 120{r}
+{y}monitor (--interval [ms]){r}{}shows bandwidth usage of hosts.
+{b}{s}e.g.: monitor
+{s}      monitor --interval 500{r}
 
-{y}watch{r}{}detects host reconnects with different IP.
-{y}watch add [ID1,ID2,...]{r}{}adds host to the reconnection watchlist.
-{b}{s}e.g.: watch add 3,4{r}
-{y}watch remove [ID1,ID2,...]{r}{}removes host from the reconnection watchlist.
-{b}{s}e.g.: watch remove all{r}
-{y}watch set [attr] [value]{r}{}changes reconnect watch settings.
-{b}{s}e.g.: watch set interval 120{r}
+{y}analyze [ID1,ID2,...]{r}{}analyzes traffic of host(s).
+{y}        (--duration [s]){r}{}
+{b}{s}e.g.: analyze 2,3
+{s}      analyze all --duration 120{r}
 
-{y}portal [enable/disable] [ID1,ID2,...]{r}{}enables DNS redirection (captive portal).
-{y}       (--ip [redirect IP]){r}{}redirects all DNS queries to specified IP.
-{b}{s}e.g.: portal enable 3,4 --ip 192.168.1.100
-{s}      portal disable all{r}
-
-{y}redirect [ID1,ID2,...]{r}{}sets up proxy redirection for host(s).
-{y}       (--to [target URL]){r}{}redirects traffic to specified URL.
-{b}{s}e.g.: redirect 3,4 --to http://example.com
-{s}      redirect all --to http://portal.local{r}
+{y}watch add|remove [ID]{r}{}adds/removes host from watch list.
+{y}      set [attribute] [value]{r}{}sets watch settings.
+{b}{s}e.g.: watch add 2
+{s}      watch remove 4
+{s}      watch set range 192.168.1.0/24
+{s}      watch set interval 5{r}
 
 {y}clear{r}{}clears the terminal window.
 
 {y}quit{r}{}quits the application.
             """.format(
-                    spaces[len('scan (--range [IP range])'):],
-                    spaces[len('hosts (--force)'):],
-                    spaces[len('limit [ID1,ID2,...] [rate]'):],
-                    spaces[len('      (--upload) (--download)'):],
-                    spaces[len('      (--dns [domains...])'):],
-                    spaces[len('block [ID1,ID2,...]'):],
-                    spaces[len('      (--upload) (--download)'):],
-                    spaces[len('      (--dns [domains...])'):],
-                    spaces[len('free [ID1,ID2,...]'):],
-                    spaces[len('add [IP] (--mac [MAC])'):],
-                    spaces[len('monitor (--interval [time in ms])'):],
-                    spaces[len('analyze [ID1,ID2,...]'):],
-                    spaces[len('        (--duration [time in s])'):],
-                    spaces[len('watch'):],
-                    spaces[len('watch add [ID1,ID2,...]'):],
-                    spaces[len('watch remove [ID1,ID2,...]'):],
-                    spaces[len('watch set [attr] [value]'):],
-                    spaces[len('portal [enable/disable] [ID1,ID2,...]'):],
-                    spaces[len('       (--ip [redirect IP])'):],
-                    spaces[len('redirect [ID1,ID2,...]'):],
-                    spaces[len('       (--to [target URL])'):],
-                    spaces[len('clear'):],
-                    spaces[len('quit'):],
-                    y=IO.Fore.LIGHTYELLOW_EX, r=IO.Style.RESET_ALL, b=IO.Style.BRIGHT,
-                    s=spaces
-                )
+                spaces[len('scan (--range [IP range])'):],
+                spaces[len('hosts (--force)'):],
+                spaces[len('limit [ID1,ID2,...] [rate]'):],
+                spaces[len('      (--upload) (--download)'):],
+                spaces[len('block [ID1,ID2,...]'):],
+                spaces[len('      (--upload) (--download)'):],
+                spaces[len('redirect [ID1,ID2,...]'):],
+                spaces[len('       (--to [IP|domain])'):],
+                spaces[len('       (--dns [domain=IP])'):],
+                spaces[len('add [IP] (--mac [MAC])'):],
+                spaces[len('free [ID1,ID2,...]'):],
+                spaces[len('monitor (--interval [ms])'):],
+                spaces[len('analyze [ID1,ID2,...]'):],
+                spaces[len('        (--duration [s])'):],
+                spaces[len('watch add|remove [ID]'):],
+                spaces[len('      set [attribute] [value]'):],
+                spaces[len('clear'):],
+                spaces[len('quit'):],
+                y=IO.Fore.LIGHTYELLOW_EX,
+                r=IO.Style.RESET_ALL,
+                b=IO.Style.BRIGHT,
+                s=spaces
+            )
         )
-
     def _quit_handler(self, args):
         self.interrupt_handler(False)
         self.stop()

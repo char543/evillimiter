@@ -313,3 +313,12 @@ class ByteValue(object):
             return number * 1024 ** 4
         else:
             raise Exception('Invalid byte string')
+
+
+def get_ip_range(gateway_ip, netmask):
+    """
+    Get IP range from gateway IP and netmask
+    """
+    import netaddr
+    network = netaddr.IPNetwork(f"{gateway_ip}/{netmask}")
+    return list(network)

@@ -319,14 +319,6 @@ class MacOSLimiter(object):
         if host.ip in self._dns_rules:
             del self._dns_rules[host.ip]
 
-    def setup_proxy_redirect(self, host):
-        """Setup transparent proxy redirection for a host"""
-        self.proxy.setup_redirection(host.ip)
-
-    def remove_proxy_redirect(self, host):
-        """Remove transparent proxy redirection for a host"""
-        self.proxy.remove_redirection(host.ip)
-
     def cleanup(self):
         """
         Cleanup temporary files

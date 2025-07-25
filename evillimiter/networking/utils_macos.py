@@ -58,14 +58,25 @@ def flush_network_settings(interface):
     Flushes all pfctl rules and dummynet pipes
     related to the given interface
     """
-    # Flush pfctl rules
-    shell.execute_suppressed('{} -F all'.format(BIN_PFCTL))
-    
-    # Delete all dummynet pipes
-    shell.execute_suppressed('{} pipe flush'.format(BIN_DNCTL))
-    
-    # Reset pfctl
-    shell.execute_suppressed('{} -d'.format(BIN_PFCTL))
+    import subprocess
+    from evillimiter.common.globals import BIN_PFCTL, BIN_DNCTL
+
+    try:
+        # Flush pfctl rules with timeout
+        subprocess.run([BIN_PFCTL, '-F', 'all'], timeout=3, check=False)
+
+        # Try to disable pfctl first
+        subprocess.run([BIN_PFCTL, '-d'], timeout=3, check=False)
+
+        # Delete all dummynet pipes with timeout
+        subprocess.run([BIN_DNCTL, 'pipe', 'flush'], timeout=3, check=False)
+
+    except subprocess.TimeoutExpired:
+        print("Warning: Timeout while flushing network settings - continuing anyway")
+    except Exception as e:
+        print(f"Warning: Error flushing network settings: {e} - continuing anyway")
+
+    return True  # Continue even if flush fails
 
 
 def validate_ip_address(ip):
