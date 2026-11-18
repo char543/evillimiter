@@ -31,3 +31,19 @@ else:
     BIN_PFCTL = None
     BIN_DNCTL = None
     BIN_IFCONFIG = None
+
+# Public DoH/DoT resolver IPs to block so clients fall back to plain DNS we see
+DOH_RESOLVER_IPS = [
+    '1.1.1.1', '1.0.0.1',                # Cloudflare
+    '8.8.8.8', '8.8.4.4',                # Google
+    '9.9.9.9', '149.112.112.112',        # Quad9
+    '94.140.14.14', '94.140.15.15',      # AdGuard
+    '208.67.222.222', '208.67.220.220',  # OpenDNS
+]
+
+# Canary domains: answering NXDOMAIN makes clients disable auto-DoH / Private Relay
+DOH_CANARY_DOMAINS = [
+    'use-application-dns.net',   # Firefox auto-DoH canary
+    'mask.icloud.com',           # Apple iCloud Private Relay
+    'mask-h2.icloud.com',        # Apple iCloud Private Relay
+]

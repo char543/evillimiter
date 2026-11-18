@@ -39,6 +39,16 @@ def get_default_netmask(interface):
         return ifaddrs[netifaces.AF_INET][0].get('netmask')
 
 
+def get_local_ip_address(interface):
+    """
+    Returns our own IPv4 address on the given interface, or None.
+    """
+    ifaddrs = netifaces.ifaddresses(interface)
+    if netifaces.AF_INET in ifaddrs:
+        return ifaddrs[netifaces.AF_INET][0].get('addr')
+    return None
+
+
 def get_mac_by_ip(interface, address):
     """
     Resolves hardware address from IP by sending ARP request
@@ -472,3 +482,14 @@ def sniff_ipv6_addresses(interface, duration=4):
     except Exception:
         pass
     return found
+
+
+def flush_pf_rules():
+    """
+    macOS: remove every pf rule we loaded and disable pf, returning the host to
+    its default (clean) networking state. Safe to call on exit / cleanup.
+    """
+    from evillimiter.common.globals import IS_MACOS, BIN_PFCTL
+    if IS_MACOS and BIN_PFCTL:
+        shell.execute_suppressed('{} -F all'.format(BIN_PFCTL))
+        shell.execute_suppressed('{} -d'.format(BIN_PFCTL))

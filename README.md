@@ -11,12 +11,52 @@ EvilLimiter has been updated to support macOS alongside Linux. The macOS impleme
 - **sysctl** for IP forwarding configuration
 - Standard networking libraries (netifaces, scapy) for interface detection and packet manipulation
 
+## Feature status
+
+| Feature | Status |
+| ------- | ------ |
+| Host discovery (`scan`, `hosts`), including IPv6 | Working |
+| Bandwidth limiting (`limit`, IPv4 and IPv6) | Working |
+| Blocking (`block`, IPv4 and IPv6) | Working |
+| DNS redirection (`redirect --dns`) | Works against clients using plain (port 53) DNS |
+| Captive portal / HTTP redirect (`redirect`, `--to`, `--harden`, `--lockdown`) | **Experimental on macOS** |
+
+`redirect` builds its DNS and `rdr` rules correctly, but transparently capturing a
+spoofed device's **forwarded** traffic is unreliable on macOS: the kernel does not
+consistently deliver `rdr`-rewritten forwarded packets to a local socket, so the
+built-in DNS server and proxy may receive nothing even though the rules match.
+Limiting, blocking and IPv6 forcing are unaffected. Treat the portal/redirect
+modes as experimental for now.
+
 ## System Requirements
 
 - macOS 10.15 (Catalina) or later
 - Python 3.7 or later
 - Administrator/root privileges
 - Xcode Command Line Tools (for development)
+
+## Quick start
+
+The fastest path is the launcher script, `run.sh` in the repo root. It:
+
+- clones the project to `~/evillimiter` only if it isn't already there, otherwise reuses the existing checkout;
+- creates the virtualenv and installs dependencies on the first run only, skipping it if `.venv` exists;
+- runs the tool as root, passing any arguments straight through.
+
+```bash
+# existing checkout
+~/evillimiter/run.sh
+
+# with arguments (e.g. choose the interface)
+~/evillimiter/run.sh -i en0
+
+# force a fresh dependency install
+rm -rf ~/evillimiter/.venv && ~/evillimiter/run.sh
+```
+
+On a brand-new machine, save `run.sh` first (or `curl` its raw URL) and run it; it will clone and set everything up. The setup steps run as your user, so the virtualenv stays user-owned, and only the tool itself runs under `sudo`.
+
+For the manual steps, see [Installation](#installation) below.
 
 ## Installation
 
@@ -77,20 +117,20 @@ EvilLimiter has been updated to support macOS alongside Linux. The macOS impleme
 
 ## Usage
 
-Run from the project folder using the virtualenv's Python:
+The easiest way to run is the launcher: `~/evillimiter/run.sh` (see [Quick start](#quick-start)). To run manually from the project folder with the virtualenv's Python:
 
 ```bash
 # Run with administrator privileges
-sudo PYTHONDONTWRITEBYTECODE=1 .venv/bin/python bin/evillimiter
+sudo .venv/bin/python bin/evillimiter
 
 # Or with a specific interface
-sudo PYTHONDONTWRITEBYTECODE=1 .venv/bin/python bin/evillimiter -i en0
+sudo .venv/bin/python bin/evillimiter -i en0
 ```
 
-`PYTHONDONTWRITEBYTECODE=1` stops Python from writing `.pyc` cache files as
-root inside the virtualenv. Without it, root-owned cache files accumulate and
-later break `pip` with `Permission denied`. `sudo` drops environment variables
-by default, so the variable is set inline, before the command.
+The launcher `bin/evillimiter` disables Python bytecode writing itself
+(`sys.dont_write_bytecode = True`), so running as root never leaves root-owned
+`.pyc` files in the virtualenv that would later break `pip`. You no longer need
+to pass `PYTHONDONTWRITEBYTECODE`.
 
 ## Platform Differences
 

@@ -12,6 +12,10 @@ class SimpleDNSServer:
         self.thread = None
         self.redirect_ip = '127.0.0.1'  # Default redirect IP
         self.domain_mappings = {}  # {domain: ip}
+        self.catch_all = False     # portal mode: answer every A query with redirect_ip
+        self.allowlist = set()     # domains to resolve upstream even in catch_all mode
+        self.upstream = ('1.1.1.1', 53)  # real resolver for unmapped / allowlisted queries
+        self.denylist = set()      # domains answered with NXDOMAIN (kill DoH/Relay canaries)
         
     def set_redirect_ip(self, ip):
         """Set the default IP to redirect to"""
@@ -21,21 +25,32 @@ class SimpleDNSServer:
         """Add specific domain -> IP mapping"""
         self.domain_mappings[domain] = ip
         print(f"DEBUG: Added DNS mapping: {domain} -> {ip}")
+
+    def add_allow(self, domain):
+        """Resolve this domain normally (upstream) even in catch_all/portal mode."""
+        self.allowlist.add(domain)
+
+    def add_deny(self, domain):
+        """Answer this domain with NXDOMAIN (disables client auto-DoH / Private Relay)."""
+        self.denylist.add(domain)
         
     def start(self):
-        """Start the DNS server"""
+        """Start the DNS server. Returns True on success, False on failure."""
         if self.running:
-            return
-            
+            return True
+
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.socket.bind((self.interface, self.port))
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind(('0.0.0.0', self.port))
             self.running = True
             self.thread = threading.Thread(target=self._server_loop, daemon=True)
             self.thread.start()
-            print(f"DEBUG: DNS server started on {self.interface}:{self.port}")
+            print(f"DEBUG: DNS server started on 0.0.0.0:{self.port}")
+            return True
         except Exception as e:
             print(f"ERROR: Failed to start DNS server: {e}")
+            return False
             
     def stop(self):
         """Stop the DNS server"""
@@ -99,22 +114,59 @@ class SimpleDNSServer:
             qclass = struct.unpack('>H', data[pos+2:pos+4])[0]
             
             print(f"DEBUG: DNS query for {domain} from {addr[0]}")
-            
-            # Only handle A records (IPv4)
-            if qtype != 1:
+
+            # 0) denied domain -> NXDOMAIN (disables client auto-DoH / Private Relay)
+            if domain in self.denylist:
+                return self._create_nxdomain_response(transaction_id, data[question_start:pos+4])
+
+            # 1) explicit per-domain override
+            if domain in self.domain_mappings:
+                if qtype == 1:
+                    return self._create_dns_response(transaction_id, domain,
+                                                     self.domain_mappings[domain],
+                                                     data[question_start:pos+4])
+                # swallow AAAA/other for a mapped domain so the device uses the mapped A
                 return None
-                
-            # Determine redirect IP
-            redirect_ip = self.domain_mappings.get(domain, self.redirect_ip)
-            
-            # Create DNS response
-            response = self._create_dns_response(transaction_id, domain, redirect_ip, data[question_start:pos+4])
-            return response
+
+            # 2) allowlisted domain (e.g. the portal host): resolve for real
+            if domain in self.allowlist:
+                return self._forward_upstream(data)
+
+            # 3) portal catch-all: point every A query at the portal host
+            if self.catch_all:
+                if qtype == 1:
+                    return self._create_dns_response(transaction_id, domain,
+                                                     self.redirect_ip,
+                                                     data[question_start:pos+4])
+                # swallow AAAA so the device falls back to our A record
+                return None
+
+            # 4) otherwise behave transparently
+            return self._forward_upstream(data)
             
         except Exception as e:
             print(f"DNS query processing error: {e}")
             return None
             
+    def _create_nxdomain_response(self, transaction_id, question_section):
+        """Build an NXDOMAIN (name does not exist) response for a query."""
+        # flags: QR=1, RD=1, RA=1, RCODE=3 (NXDOMAIN) -> 0x8183
+        header = struct.pack('>HHHHHH', transaction_id, 0x8183, 1, 0, 0, 0)
+        return header + question_section
+
+    def _forward_upstream(self, data):
+        """Relay a raw query to the upstream resolver and return its response."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(3)
+            s.sendto(data, self.upstream)
+            response, _ = s.recvfrom(4096)
+            s.close()
+            return response
+        except Exception as e:
+            print(f"DNS upstream forward error: {e}")
+            return None
+
     def _create_dns_response(self, transaction_id, domain, ip, question_section):
         """Create DNS response packet"""
         try:

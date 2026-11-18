@@ -15,6 +15,7 @@ from evillimiter.console.chart import BarChart
 from evillimiter.console.banner import get_main_banner
 from evillimiter.networking.host import Host
 from evillimiter.networking.limit import create_limiter, Direction
+from evillimiter.common.globals import DOH_RESOLVER_IPS, DOH_CANARY_DOMAINS
 from evillimiter.networking.spoof import ARPSpoofer
 from evillimiter.networking.ndp_spoof import NDPSpoofer
 from evillimiter.networking.dns_server import SimpleDNSServer
@@ -74,6 +75,8 @@ class MainMenu(CommandMenu):
         redirect_parser.add_parameter('id')
         redirect_parser.add_parameterized_flag('--to', 'to')
         redirect_parser.add_parameterized_flag('--dns', 'dns')
+        redirect_parser.add_flag('--harden', 'harden')
+        redirect_parser.add_flag('--lockdown', 'lockdown')
 
         self.parser.add_subparser('help', self._help_handler)
         self.parser.add_subparser('?', self._help_handler)
@@ -658,52 +661,78 @@ class MainMenu(CommandMenu):
                 IO.error("Invalid --dns format. Use: --dns domain=ip")
                 return
 
-        # Initialize DNS server if needed (with proper interface)
+        # Resolve our own IPv4 on the interface (portal / rdr target)
+        local_ip = netutils.get_local_ip_address(self.interface)
+        if local_ip is None:
+            IO.error('could not determine local IPv4 address for {}.'.format(self.interface))
+            return
+
+        # Single DNS server bound to 0.0.0.0:5354
         if not self.dns_server:
-            self.dns_server = SimpleDNSServer(interface=self.interface, port=5354)
-            try:
-                self.dns_server.start()
-            except Exception as e:
-                IO.error(f'Failed to start DNS server: {e}')
+            self.dns_server = SimpleDNSServer(port=5354)
+            if not self.dns_server.start():
+                IO.error('failed to start DNS server (is port 5354 already in use?).')
                 return
+
+        # Decide redirection mode from the arguments
+        if dns_mappings:
+            # selective: map given domains, resolve everything else normally
+            self.dns_server.catch_all = False
+            for domain, ip in dns_mappings.items():
+                self.dns_server.add_domain_mapping(domain, ip)
+            portal_url = None
+            include_http = False
+        else:
+            # captive-portal: DNS answers everything with us; HTTP 302 to portal
+            self.dns_server.catch_all = True
+            self.dns_server.set_redirect_ip(local_ip)
+            if getattr(args, 'to', None):
+                portal_url = args.to if args.to.startswith(('http://', 'https://')) else 'http://' + args.to
+                # allow the portal's own host to resolve for real so the 302 target loads
+                try:
+                    from urllib.parse import urlparse
+                    portal_host = urlparse(portal_url).hostname
+                    if portal_host and not netutils.validate_ip_address(portal_host):
+                        self.dns_server.add_allow(portal_host)
+                except Exception:
+                    pass
+            else:
+                portal_url = None  # proxy serves its built-in page
+            include_http = True
+
+        # Hardening ladder: --harden pushes encrypted DNS back to plain DNS;
+        # --lockdown blocks everything except our DNS + portal (implies harden).
+        lockdown = bool(getattr(args, 'lockdown', False))
+        harden = lockdown or bool(getattr(args, 'harden', False))
+        doh_ips = DOH_RESOLVER_IPS if harden else None
+        if harden:
+            for _canary in DOH_CANARY_DOMAINS:
+                self.dns_server.add_deny(_canary)
 
         for host in hosts:
             if not host.spoofed:
                 self.arp_spoofer.add(host)
-            
+            self.ndp_spoofer.add(host)
+
             try:
-                # Get local interface IP for redirection
-                try:
-                    local_ip = netutils.get_local_ip_address(self.interface)
-                except Exception:
-                    local_ip = '127.0.0.1'  # Fallback to localhost if can't get interface IP
-                
-                # Configure DNS server first
+                _, routable6 = netutils.split_ipv6_addresses(host.ipv6)
+                self.limiter.proxy.setup_redirection(host.ip, local_ip, portal_url, include_http,
+                                                     block_ipv6=routable6, harden=harden,
+                                                     lockdown=lockdown, doh_ips=doh_ips)
+
                 if dns_mappings:
-                    for domain, ip in dns_mappings.items():
-                        self.dns_server.add_domain_mapping(domain, ip)
-                elif target_ip:
-                    self.dns_server.set_redirect_ip(target_ip)
-                else:
-                    self.dns_server.set_redirect_ip(local_ip)
-                
-                # Now set up the proxy redirection
-                self.limiter.proxy.setup_redirection(host.ip, target_ip, dns_mappings)
-                
-                if target_ip:
-                    msg = f"{args.to} ({target_ip})" if target_ip != args.to else target_ip
-                    IO.ok('{}{}{} redirected to {}.'.format(
-                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, msg))
-                elif dns_mappings:
                     domain = list(dns_mappings.keys())[0]
                     ip = dns_mappings[domain]
-                    IO.ok('{}{}{} DNS mapping: {} -> {}'.format(
-                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL, domain, ip))
+                    IO.ok('{}{}{r} DNS: {} -> {}.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, domain, ip, r=IO.Style.RESET_ALL))
+                elif portal_url:
+                    IO.ok('{}{}{r} redirected to portal {}.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, portal_url, r=IO.Style.RESET_ALL))
                 else:
-                    IO.ok('{}{}{} redirected to local proxy.'.format(
-                        IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL))
+                    IO.ok('{}{}{r} redirected to the built-in portal page.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, r=IO.Style.RESET_ALL))
             except Exception as e:
-                IO.error(f'Failed to set up redirection for {host.ip}: {e}')
+                IO.error('failed to set up redirection for {}: {}'.format(host.ip, e))
 
     def _reconnect_callback(self, old_host, new_host):
         """
@@ -738,95 +767,68 @@ class MainMenu(CommandMenu):
 
     def _help_handler(self, args):
         """
-        Handles 'help' command-line argument
-        Prints help message including commands and usage
+        Handles the 'help' command: prints all commands plus the redirect modes.
         """
-        spaces = ' ' * 35
+        Y = IO.Fore.LIGHTYELLOW_EX
+        G = IO.Fore.LIGHTGREEN_EX
+        R = IO.Style.RESET_ALL
+        B = IO.Style.BRIGHT
 
-        IO.print(
-            """
-{y}scan (--range [IP range]){r}{}scans for online hosts on your network.
-{s}required to find the hosts you want to limit.
-{b}{s}e.g.: scan
-{s}      scan --range 192.168.178.1-192.168.178.50
-{s}      scan --range 192.168.178.1/24{r}
+        commands = [
+            ('scan (--range [range])', 'scan the network for online hosts; run this first.',
+             ['scan', 'scan --range 192.168.0.0/24']),
+            ('hosts (--force)', 'list scanned hosts with IDs, MACs and IPv6 addresses.', []),
+            ('limit [IDs] [rate] (--upload|--download)', 'limit host bandwidth (IPv4 and IPv6).',
+             ['limit 4 100kbit', 'limit 2,3 1mbit --download', 'limit all 200kbit']),
+            ('block [IDs] (--upload|--download)', 'cut a host off the internet (IPv4 and IPv6).',
+             ['block 2', 'block all']),
+            ('redirect [IDs] (--dns d=IP) (--to IP|URL) (--harden) (--lockdown)',
+             'capture host DNS and HTTP; see redirect modes below.',
+             ['redirect 2 --dns google.com=66.254.114.41',
+              'redirect 2 --dns ads.example=1.2.3.4 --harden',
+              'redirect 2 --to http://portal.local/',
+              'redirect 2 --lockdown']),
+            ('free [IDs]', 'remove every limit, block and redirect from a host.',
+             ['free 3,4', 'free all']),
+            ('add [IP] (--mac MAC)', 'add a host to the list manually.', ['add 192.168.0.24']),
+            ('monitor (--interval ms)', 'show live per-host bandwidth usage.', ['monitor']),
+            ('analyze [IDs] (--duration s)', 'capture and summarise host traffic.',
+             ['analyze all --duration 60']),
+            ('watch add|remove [ID]  /  watch set [attr] [value]',
+             're-apply rules automatically when a host reconnects.',
+             ['watch add 2', 'watch set interval 5']),
+            ('clear', 'clear the terminal.', []),
+            ('quit', 'quit and flush all rules.', []),
+        ]
 
-{y}hosts (--force){r}{}lists all scanned hosts.
-{s}contains host information, including IDs.
+        out = ['', f'{B}Commands{R}', '']
+        for cmd, desc, examples in commands:
+            out.append(f'  {Y}{cmd}{R}')
+            out.append(f'      {desc}')
+            for ex in examples:
+                out.append(f'      {G}e.g. {ex}{R}')
+            out.append('')
 
-{y}limit [ID1,ID2,...] [rate]{r}{}limits bandwidth of host(s).
-{y}      (--upload) (--download){r}{}
-{b}{s}e.g.: limit 4 100kbit
-{s}      limit 2,3,4 1gbit --download
-{s}      limit all 200kbit --upload{r}
+        out += [
+            f'{B}Redirect modes{R}',
+            '',
+            f'  {Y}--dns d=IP{R}   point one domain at an IP for this host; everything else',
+            '               resolves normally. forces IPv4 so it cannot leak over v6.',
+            f'  {Y}--to IP|URL{R}  send a 302 to this target for the host HTTP (port 80).',
+            f'  {Y}(no flag){R}    serve the built-in portal page on HTTP.',
+            f'  {Y}--harden{R}     also block DoT (853) and known DoH resolver IPs, and answer',
+            '               the Firefox / Apple Private Relay canaries with NXDOMAIN, so the',
+            '               host falls back to the plain DNS you control. internet still works.',
+            f'  {Y}--lockdown{R}   block everything except your DNS and portal (implies --harden);',
+            '               herds the host to a captive portal, like Cisco / UniFi.',
+            '',
+            f'  {B}note{R}: HTTPS content cannot be swapped without a trusted cert on the device.',
+            '        redirect controls DNS and plain HTTP. an HTTPS site whose domain is',
+            '        pointed elsewhere shows a certificate error, not the new content.',
+            '',
+        ]
+        IO.print('\n'.join(out))
 
-{y}block [ID1,ID2,...]{r}{}blocks internet access of host(s).
-{y}      (--upload) (--download){r}{}
-{b}{s}e.g.: block 2
-{s}      block 1,2 --upload
-{s}      block all --download{r}
-
-{y}redirect [ID1,ID2,...]{r}{}redirects traffic through local proxy.
-{y}       (--to [IP|domain]){r}{}redirects all traffic to specified target.
-{y}       (--dns [domain=IP]){r}{}maps specific domain to IP address.
-{b}{s}e.g.: redirect 2
-{s}      redirect 3 --to 192.168.1.100
-{s}      redirect 4 --to example.com
-{s}      redirect 2 --dns google.com=192.168.1.100{r}
-
-{y}add [IP] (--mac [MAC]){r}{}adds custom host to host list.
-{s}mac resolved automatically.
-{b}{s}e.g.: add 192.168.178.24
-{s}      add 192.168.1.50 --mac 1c:fc:bc:2d:a6:37{r}
-
-{y}free [ID1,ID2,...]{r}{}removes any restrictions from host(s).
-{b}{s}e.g.: free 3,4
-{s}      free all{r}
-
-{y}monitor (--interval [ms]){r}{}shows bandwidth usage of hosts.
-{b}{s}e.g.: monitor
-{s}      monitor --interval 500{r}
-
-{y}analyze [ID1,ID2,...]{r}{}analyzes traffic of host(s).
-{y}        (--duration [s]){r}{}
-{b}{s}e.g.: analyze 2,3
-{s}      analyze all --duration 120{r}
-
-{y}watch add|remove [ID]{r}{}adds/removes host from watch list.
-{y}      set [attribute] [value]{r}{}sets watch settings.
-{b}{s}e.g.: watch add 2
-{s}      watch remove 4
-{s}      watch set range 192.168.1.0/24
-{s}      watch set interval 5{r}
-
-{y}clear{r}{}clears the terminal window.
-
-{y}quit{r}{}quits the application.
-            """.format(
-                spaces[len('scan (--range [IP range])'):],
-                spaces[len('hosts (--force)'):],
-                spaces[len('limit [ID1,ID2,...] [rate]'):],
-                spaces[len('      (--upload) (--download)'):],
-                spaces[len('block [ID1,ID2,...]'):],
-                spaces[len('      (--upload) (--download)'):],
-                spaces[len('redirect [ID1,ID2,...]'):],
-                spaces[len('       (--to [IP|domain])'):],
-                spaces[len('       (--dns [domain=IP])'):],
-                spaces[len('add [IP] (--mac [MAC])'):],
-                spaces[len('free [ID1,ID2,...]'):],
-                spaces[len('monitor (--interval [ms])'):],
-                spaces[len('analyze [ID1,ID2,...]'):],
-                spaces[len('        (--duration [s])'):],
-                spaces[len('watch add|remove [ID]'):],
-                spaces[len('      set [attribute] [value]'):],
-                spaces[len('clear'):],
-                spaces[len('quit'):],
-                y=IO.Fore.LIGHTYELLOW_EX,
-                r=IO.Style.RESET_ALL,
-                b=IO.Style.BRIGHT,
-                s=spaces
-            )
-        )
     def _quit_handler(self, args):
         self.interrupt_handler(False)
         self.stop()

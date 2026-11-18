@@ -23,7 +23,16 @@ class TransparentProxy:
         self.port = port
         self.running = False
         self.thread = None
-        self.redirect_rules = {}  # {host_ip: redirect_target}
+        self.redirect_rules = {}  # {host_ip: redirect_target or None for built-in page}
+        self.portal_html = (
+            "<!doctype html><html><head>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>Network Access</title></head>"
+            "<body style='font-family:sans-serif;text-align:center;padding:3em'>"
+            "<h1>Network Access Portal</h1>"
+            "<p>This device is managed. Please contact the network administrator.</p>"
+            "</body></html>"
+        )
 
     def start(self):
         """Start the transparent proxy server"""
@@ -44,28 +53,60 @@ class TransparentProxy:
         self.redirect_rules[host_ip] = target_url
         print(f"DEBUG: Added redirect rule: {host_ip} -> {target_url}")
 
-    def setup_redirection(self, host_ip, target_ip=None, dns_mappings=None):
-        """Setup traffic redirection using pfctl"""
-        # Start DNS server if not running
-        if not hasattr(self, 'dns_server'):
-            from .dns_server import SimpleDNSServer
-            self.dns_server = SimpleDNSServer()
-            self.dns_server.start()
-            
-        # Configure DNS server
-        redirect_ip = target_ip if target_ip else '127.0.0.1'
-        self.dns_server.set_redirect_ip(redirect_ip)
+    def setup_redirection(self, host_ip, local_ip, portal_url=None, include_http=True, block_ipv6=None, harden=False, lockdown=False, doh_ips=None):
+        """Install pf rdr rules so the host\'s DNS (and optionally HTTP) is sent
+        to us, and register the host\'s HTTP target (None => built-in page).
 
-        # Generate rules
-        rules = []
-        
-        # Redirection rules (exactly as they were in portal)
-        rules.extend([
-            f"rdr pass on {self.interface} inet proto udp from {host_ip} to any port 53 -> 127.0.0.1 port 5354",
-            f"rdr pass on {self.interface} inet proto tcp from {host_ip} to any port 53 -> 127.0.0.1 port 5354",
-            f"rdr pass on {self.interface} inet proto tcp from {host_ip} to any port 80 -> 127.0.0.1 port {self.port}",
-            f"rdr pass on {self.interface} inet proto tcp from {host_ip} to any port 443 -> 127.0.0.1 port {self.port}"
-        ])
+        HTTPS is intentionally left alone: TLS cannot be transparently
+        intercepted without a trusted certificate, so real captive portals
+        never redirect 443.
+        """
+        self.redirect_rules[host_ip] = portal_url
+
+        # On macOS, pf rdr must point forwarded traffic at 127.0.0.1 to be
+        # delivered to a local socket. Redirecting to our LAN IP increments the
+        # rdr counter but the packet never reaches the listening server.
+        rdr_target = '127.0.0.1'
+        rules = [
+            f"rdr pass on {self.interface} inet proto udp from {host_ip} to any port 53 -> {rdr_target} port 5354",
+            f"rdr pass on {self.interface} inet proto tcp from {host_ip} to any port 53 -> {rdr_target} port 5354",
+        ]
+        if include_http:
+            rules.append(f"rdr pass on {self.interface} inet proto tcp from {host_ip} to any port 80 -> {rdr_target} port {self.port}")
+
+        # A forwarded packet rewritten by rdr must be routed onto loopback to be
+        # delivered to our local socket; without route-to lo0 the rdr rule counts
+        # the packet but it never reaches the listening server.
+        rules.append(f"pass in quick on {self.interface} route-to (lo0 127.0.0.1) inet proto udp from {host_ip} to any port 53")
+        rules.append(f"pass in quick on {self.interface} route-to (lo0 127.0.0.1) inet proto tcp from {host_ip} to any port 53")
+        if include_http:
+            rules.append(f"pass in quick on {self.interface} route-to (lo0 127.0.0.1) inet proto tcp from {host_ip} to any port 80")
+
+        # Force IPv4: block the target\'s IPv6 so it can\'t bypass our IPv4 DNS.
+        # rdr (translation) rules must precede block (filter) rules in a pf ruleset.
+        for addr in (block_ipv6 or []):
+            rules.append(f"block return out quick on {self.interface} inet6 from {addr}")
+            rules.append(f"block return in quick on {self.interface} inet6 to {addr}")
+
+        if lockdown:
+            # Captive lockdown. Explicitly allow all traffic between the host and
+            # us (the rdr above rewrites its DNS/HTTP destination to our IP), allow
+            # DHCP so the lease survives, then block everything else. The explicit
+            # host<->us pass is what keeps the catch-all block from eating the
+            # redirected DNS/HTTP.
+            rules.append(f"pass quick on {self.interface} inet from {host_ip} to {local_ip}")
+            rules.append(f"pass quick on {self.interface} inet from {local_ip} to {host_ip}")
+            rules.append(f"pass out quick on {self.interface} inet proto udp from {host_ip} to any port 67")
+            rules.append(f"pass out quick on {self.interface} inet proto udp from {host_ip} to any port 68")
+            rules.append(f"block return out quick on {self.interface} inet from {host_ip}")
+        elif harden:
+            # Push encrypted DNS back to plain port 53 (which we capture), without
+            # cutting the rest of the device's connectivity.
+            rules.append(f"block return out quick on {self.interface} inet proto tcp from {host_ip} to any port 853")
+            rules.append(f"block return out quick on {self.interface} inet proto udp from {host_ip} to any port 853")
+            for ip in (doh_ips or []):
+                rules.append(f"block return out quick on {self.interface} inet proto tcp from {host_ip} to {ip} port 443")
+                rules.append(f"block return out quick on {self.interface} inet proto tcp from {host_ip} to {ip} port 853")
 
         # Write rules to temp file
         fd, rules_file = tempfile.mkstemp()
@@ -73,7 +114,7 @@ class TransparentProxy:
 
         try:
             with open(rules_file, 'w') as f:
-                f.write('\n'.join(rules))
+                f.write('\n'.join(rules) + '\n')
                 
             print("DEBUG: Generated rules:")
             print('\n'.join(rules))
@@ -83,7 +124,16 @@ class TransparentProxy:
             shell.execute_suppressed(f'{BIN_PFCTL} -e')
             
             # Load rules exactly as portal did
-            shell.execute_suppressed(f'{BIN_PFCTL} -f {rules_file}')
+            # Load WITHOUT suppressing errors so a bad ruleset is visible
+            proc = subprocess.run([BIN_PFCTL, '-f', rules_file],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"DEBUG: pfctl -f FAILED (exit {proc.returncode}): {proc.stderr.strip()}")
+            else:
+                show = subprocess.run([BIN_PFCTL, '-s', 'nat'],
+                                      capture_output=True, text=True)
+                active = '\n'.join(l for l in show.stdout.splitlines() if 'rdr' in l) or '(none)'
+                print(f"DEBUG: pfctl -f OK; active rdr rules:\n{active}")
                 
         finally:
             if os.path.exists(rules_file):
@@ -179,15 +229,14 @@ class TransparentProxy:
             url = parts[1].decode('utf-8')
             version = parts[2].decode('utf-8')
 
-            # Check if we should redirect this host
-            if client_addr[0] in self.redirect_rules:
-                target_url = self.redirect_rules[client_addr[0]]
+            # Serve a 302 to the portal URL, or the built-in portal page
+            target_url = self.redirect_rules.get(client_addr[0])
+            if target_url:
                 if not target_url.startswith(('http://', 'https://')):
                     target_url = 'http://' + target_url
 
                 print(f"DEBUG: Redirecting {client_addr[0]} {method} {url} to {target_url}")
 
-                # Send 302 redirect
                 response = [
                     "HTTP/1.1 302 Found",
                     f"Location: {target_url}",
@@ -198,15 +247,16 @@ class TransparentProxy:
                 ]
                 client_socket.send('\r\n'.join(response).encode())
             else:
-                # No redirect rule - send 404
-                response = [
-                    "HTTP/1.1 404 Not Found",
+                body = self.portal_html.encode('utf-8')
+                headers = [
+                    "HTTP/1.1 200 OK",
+                    "Content-Type: text/html; charset=utf-8",
+                    f"Content-Length: {len(body)}",
                     "Connection: close",
-                    "Content-Length: 0",
                     "",
                     ""
                 ]
-                client_socket.send('\r\n'.join(response).encode())
+                client_socket.send('\r\n'.join(headers).encode() + body)
 
         except Exception as e:
             print(f"HTTP handler error: {e}")

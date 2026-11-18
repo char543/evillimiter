@@ -151,6 +151,7 @@ def cleanup(interface):
     netutils.delete_qdisc_root(interface)
     netutils.disable_ip_forwarding()
     netutils.disable_ipv6_forwarding()
+    netutils.flush_pf_rules()
 
 
 def run():

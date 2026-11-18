@@ -4,6 +4,11 @@
 import os
 import sys
 
+# Never write .pyc files. Running as root would otherwise leave root-owned
+# bytecode caches in the virtualenv that later break pip/pipx. Baked in here so
+# the tool launches without needing PYTHONDONTWRITEBYTECODE in the environment.
+sys.dont_write_bytecode = True
+
 
 if __name__ == '__main__':
     dir_of_executable = os.path.dirname(__file__)
