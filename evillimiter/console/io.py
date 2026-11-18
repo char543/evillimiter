@@ -5,11 +5,10 @@ import readline
 import colorama
 from . import shell
 
-# Configure readline and history
+# Configure readline and command history
 HISTFILE = os.path.expanduser('~/.evillimiter_history')
 HISTFILE_SIZE = 1000
 
-# Configure readline behavior
 readline.parse_and_bind('set enable-keypad on')
 readline.parse_and_bind('set input-meta on')
 readline.parse_and_bind('set convert-meta off')
@@ -21,38 +20,24 @@ readline.parse_and_bind('set editing-mode emacs')  # Use emacs-style editing
 readline.parse_and_bind('set horizontal-scroll-mode on')
 readline.parse_and_bind('set completion-ignore-case on')
 
-# Try to load history file
+# Load the history file if present. A missing file is fine, and so is one we
+# cannot read or write (for example, one left root-owned by an earlier sudo
+# run): the history is a convenience and must never stop the program starting.
 try:
     readline.read_history_file(HISTFILE)
     readline.set_history_length(HISTFILE_SIZE)
-except FileNotFoundError:
+except (FileNotFoundError, PermissionError, OSError):
     pass
 
-# Save history on exit
-atexit.register(readline.write_history_file, HISTFILE)
 
-# Set up readline history
-HISTFILE = os.path.expanduser('~/.evillimiter_history')
-HISTFILE_SIZE = 1000
+def _save_history():
+    try:
+        readline.write_history_file(HISTFILE)
+    except (PermissionError, OSError):
+        pass
 
-# Configure readline
-readline.parse_and_bind('set enable-keypad on')
-readline.parse_and_bind('set input-meta on')
-readline.parse_and_bind('set convert-meta off')
-readline.parse_and_bind('set output-meta on')
-readline.parse_and_bind('set mark-directories on')
-readline.parse_and_bind('set show-all-if-ambiguous on')
-readline.parse_and_bind('set echo-control-characters off')
 
-# Try to load history file
-try:
-    readline.read_history_file(HISTFILE)
-    readline.set_history_length(HISTFILE_SIZE)
-except FileNotFoundError:
-    pass
-
-# Save history on exit
-atexit.register(readline.write_history_file, HISTFILE)
+atexit.register(_save_history)
 
 
 class IO(object):

@@ -1,6 +1,6 @@
 import re
 import netifaces
-from scapy.all import ARP, sr1
+from scapy.all import ARP, Ether, srp1
 
 import evillimiter.console.shell as shell
 from evillimiter.common.globals import BIN_PFCTL, BIN_DNCTL, BIN_SYSCTL, BIN_IFCONFIG, IP_FORWARD_LOC
@@ -39,11 +39,11 @@ def get_mac_by_ip(interface, address):
     and receiving ARP response
     """
     # ARP packet with operation 1 (who-is)
-    packet = ARP(op=1, pdst=address)
-    response = sr1(packet, timeout=3, verbose=0, iface=interface)
+    packet = Ether(dst='ff:ff:ff:ff:ff:ff') / ARP(op=1, pdst=address)
+    response = srp1(packet, timeout=3, verbose=0, iface=interface)
 
     if response is not None:
-        return response.hwsrc
+        return response[ARP].hwsrc
 
 
 def exists_interface(interface):

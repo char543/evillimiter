@@ -2,7 +2,7 @@ import sys
 import socket
 from tqdm import tqdm
 from netaddr import IPAddress
-from scapy.all import sr1, ARP # pylint: disable=no-name-in-module
+from scapy.all import srp1, ARP, Ether # pylint: disable=no-name-in-module
 from concurrent.futures import ThreadPoolExecutor
 
 from .host import Host
@@ -46,6 +46,22 @@ class HostScanner(object):
                 iterator.close()
                 IO.ok('aborted. waiting for shutdown...')
 
+            # best-effort IPv6 discovery: map each host's MAC to its IPv6 addrs
+            try:
+                from . import utils as netutils6
+                netutils6.solicit_ipv6_neighbors(self.interface)
+                neighbor_map = netutils6.get_ipv6_neighbor_map(self.interface)
+                sniffed = netutils6.sniff_ipv6_addresses(self.interface, duration=4)
+                for host in hosts:
+                    mac = netutils6._normalize_mac(host.mac)
+                    addrs = list(neighbor_map.get(mac, []))
+                    for a in sniffed.get(mac, []):
+                        if a not in addrs:
+                            addrs.append(a)
+                    host.ipv6 = addrs
+            except Exception:
+                pass
+
             return hosts
 
     def scan_for_reconnects(self, hosts, iprange=None):
@@ -70,8 +86,8 @@ class HostScanner(object):
         Sends ARP packet and listens for answer,
         if present the host is online
         """
-        packet = ARP(op=1, pdst=ip)
-        answer = sr1(packet, retry=self.retries, timeout=self.timeout, verbose=0, iface=self.interface)
+        packet = Ether(dst='ff:ff:ff:ff:ff:ff') / ARP(op=1, pdst=ip)
+        answer = srp1(packet, retry=self.retries, timeout=self.timeout, verbose=0, iface=self.interface)
         
         if answer is not None:
-            return Host(ip, answer.hwsrc, '')
+            return Host(ip, answer[ARP].hwsrc, '')

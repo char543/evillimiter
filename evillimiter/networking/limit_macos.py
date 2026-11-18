@@ -7,6 +7,7 @@ import evillimiter.console.shell as shell
 from .host import Host
 from evillimiter.common.globals import BIN_PFCTL, BIN_DNCTL
 from .transparent_proxy import TransparentProxy
+from .utils import split_ipv6_addresses
 
 
 class MacOSLimiter(object):
@@ -165,7 +166,16 @@ class MacOSLimiter(object):
                 self.interface, host.ip, host_ids.download_id)
             new_rules.append(rule)
             self._active_rules.append(rule)
-        
+
+        # IPv6: shape each routable address into the same pipes
+        for addr in split_ipv6_addresses(host.ipv6)[1]:
+            if (direction & Direction.OUTGOING) == Direction.OUTGOING:
+                self._active_rules.append('dummynet out quick on {} inet6 from {} to any pipe {}'.format(
+                    self.interface, addr, host_ids.upload_id))
+            if (direction & Direction.INCOMING) == Direction.INCOMING:
+                self._active_rules.append('dummynet in quick on {} inet6 from any to {} pipe {}'.format(
+                    self.interface, addr, host_ids.download_id))
+
         self._load_all_pfctl_rules()
 
     def _generate_dns_redirect_rules(self, host, redirect_ip):
@@ -195,7 +205,14 @@ class MacOSLimiter(object):
         if (direction & Direction.INCOMING) == Direction.INCOMING:
             rule = 'block in quick on {} to {}'.format(self.interface, host.ip)
             self._active_rules.append(rule)
-        
+
+        # IPv6: block each routable address
+        for addr in split_ipv6_addresses(host.ipv6)[1]:
+            if (direction & Direction.OUTGOING) == Direction.OUTGOING:
+                self._active_rules.append('block out quick on {} inet6 from {}'.format(self.interface, addr))
+            if (direction & Direction.INCOMING) == Direction.INCOMING:
+                self._active_rules.append('block in quick on {} inet6 to {}'.format(self.interface, addr))
+
         self._load_all_pfctl_rules()
 
     def _regenerate_pfctl_rules(self):
@@ -223,6 +240,21 @@ class MacOSLimiter(object):
                     if (direction & Direction.INCOMING) == Direction.INCOMING:
                         self._active_rules.append('dummynet in quick on {} inet from any to {} pipe {}'.format(
                             self.interface, host.ip, host_ids.download_id))
+
+                # IPv6 rules for each routable address of this host
+                for addr in split_ipv6_addresses(host.ipv6)[1]:
+                    if rate is None:
+                        if (direction & Direction.OUTGOING) == Direction.OUTGOING:
+                            self._active_rules.append('block out quick on {} inet6 from {}'.format(self.interface, addr))
+                        if (direction & Direction.INCOMING) == Direction.INCOMING:
+                            self._active_rules.append('block in quick on {} inet6 to {}'.format(self.interface, addr))
+                    else:
+                        if (direction & Direction.OUTGOING) == Direction.OUTGOING:
+                            self._active_rules.append('dummynet out quick on {} inet6 from {} to any pipe {}'.format(
+                                self.interface, addr, host_ids.upload_id))
+                        if (direction & Direction.INCOMING) == Direction.INCOMING:
+                            self._active_rules.append('dummynet in quick on {} inet6 from any to {} pipe {}'.format(
+                                self.interface, addr, host_ids.download_id))
         
         self._load_all_pfctl_rules()
 

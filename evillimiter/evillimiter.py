@@ -138,6 +138,9 @@ def initialize(interface):
         IO.error('ip forwarding could not be enabled.')
         return False
 
+    # best-effort: enable IPv6 forwarding for IPv6 interception
+    netutils.enable_ipv6_forwarding()
+
     return True
 
 
@@ -147,6 +150,7 @@ def cleanup(interface):
     """
     netutils.delete_qdisc_root(interface)
     netutils.disable_ip_forwarding()
+    netutils.disable_ipv6_forwarding()
 
 
 def run():

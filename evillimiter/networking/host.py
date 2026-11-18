@@ -6,6 +6,7 @@ class Host(object):
         self.ip = ip
         self.mac = mac
         self.name = name
+        self.ipv6 = []          # discovered IPv6 addresses for this device
         self.spoofed = False
         self.limited = False
         self.blocked = False

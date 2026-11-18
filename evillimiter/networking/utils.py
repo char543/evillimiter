@@ -1,7 +1,7 @@
 import re
 import platform
 import netifaces
-from scapy.all import ARP, sr1 # pylint: disable=no-name-in-module
+from scapy.all import ARP, Ether, srp1 # pylint: disable=no-name-in-module
 
 import evillimiter.console.shell as shell
 from evillimiter.common.globals import IS_MACOS, IS_LINUX, BIN_SYSCTL, IP_FORWARD_LOC
@@ -45,11 +45,11 @@ def get_mac_by_ip(interface, address):
     and receiving ARP response
     """
     # ARP packet with operation 1 (who-is)
-    packet = ARP(op=1, pdst=address)
-    response = sr1(packet, timeout=3, verbose=0, iface=interface)
+    packet = Ether(dst='ff:ff:ff:ff:ff:ff') / ARP(op=1, pdst=address)
+    response = srp1(packet, timeout=3, verbose=0, iface=interface)
 
     if response is not None:
-        return response.hwsrc
+        return response[ARP].hwsrc
 
 
 def exists_interface(interface):
@@ -322,3 +322,153 @@ def get_ip_range(gateway_ip, netmask):
     import netaddr
     network = netaddr.IPNetwork(f"{gateway_ip}/{netmask}")
     return list(network)
+
+
+# ---------------------------------------------------------------------------
+# IPv6 support helpers
+# ---------------------------------------------------------------------------
+
+def _looks_like_mac(token):
+    return token.count(':') == 5 and all(
+        1 <= len(p) <= 2 and all(c in '0123456789abcdefABCDEF' for c in p)
+        for p in token.split(':')
+    )
+
+
+def _normalize_mac(mac):
+    # ndp may print octets without leading zeros (e.g. '0:1a:2b:...')
+    return ':'.join(p.rjust(2, '0').lower() for p in mac.split(':'))
+
+
+def enable_ipv6_forwarding():
+    from evillimiter.common.globals import BIN_SYSCTL, IP6_FORWARD_LOC
+    return shell.execute_suppressed('{} -w {}=1'.format(BIN_SYSCTL, IP6_FORWARD_LOC)) == 0
+
+
+def disable_ipv6_forwarding():
+    from evillimiter.common.globals import BIN_SYSCTL, IP6_FORWARD_LOC
+    return shell.execute_suppressed('{} -w {}=0'.format(BIN_SYSCTL, IP6_FORWARD_LOC)) == 0
+
+
+def solicit_ipv6_neighbors(interface, count=2):
+    """
+    Pings the link-local all-nodes multicast group so on-link IPv6 devices
+    answer and populate the neighbor cache. Best-effort; ignores failures.
+    """
+    from evillimiter.common.globals import IS_MACOS
+    if IS_MACOS:
+        cmd = 'ping6 -c {} ff02::1%{}'.format(count, interface)
+    else:
+        cmd = 'ping -6 -c {} -I {} ff02::1'.format(count, interface)
+    shell.execute_suppressed(cmd, root=False)
+
+
+def get_ipv6_neighbor_map(interface):
+    """
+    Returns {mac: [ipv6, ...]} from the OS IPv6 neighbor cache.
+    """
+    from evillimiter.common.globals import IS_MACOS
+    mac_to_ipv6 = {}
+    try:
+        out = shell.output('ndp -an', root=False) if IS_MACOS else shell.output('ip -6 neigh', root=False)
+    except Exception:
+        return mac_to_ipv6
+
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        if IS_MACOS:
+            addr, mac = parts[0], parts[1]
+        else:
+            addr = parts[0]
+            mac = parts[parts.index('lladdr') + 1] if 'lladdr' in parts else ''
+        addr = addr.split('%')[0]
+        if ':' not in addr or not _looks_like_mac(mac):
+            continue
+        mac = _normalize_mac(mac)
+        mac_to_ipv6.setdefault(mac, [])
+        if addr not in mac_to_ipv6[mac]:
+            mac_to_ipv6[mac].append(addr)
+    return mac_to_ipv6
+
+
+def get_host_ipv6_addresses(mac, interface, solicit=True):
+    """
+    Discovers the IPv6 addresses of a device (by MAC) via the neighbor cache.
+    """
+    if solicit:
+        solicit_ipv6_neighbors(interface)
+    return get_ipv6_neighbor_map(interface).get(_normalize_mac(mac), [])
+
+
+def split_ipv6_addresses(addresses):
+    """
+    Splits IPv6 addresses into (link_local, routable).
+    """
+    link_local = [a for a in addresses if a.lower().startswith('fe80')]
+    routable = [a for a in addresses if not a.lower().startswith('fe80')]
+    return link_local, routable
+
+
+def get_gateway_ipv6(interface):
+    """
+    Returns (address, mac) of the default IPv6 router, or (None, None).
+    The router address is typically a link-local (fe80::) address.
+    """
+    from evillimiter.common.globals import IS_MACOS
+    gateway = None
+    try:
+        if IS_MACOS:
+            out = shell.output('netstat -rn -f inet6', root=False)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == 'default':
+                    gateway = parts[1]
+                    break
+        else:
+            out = shell.output('ip -6 route show default', root=False)
+            parts = out.split()
+            if 'via' in parts:
+                gateway = parts[parts.index('via') + 1]
+    except Exception:
+        return (None, None)
+
+    if gateway is None:
+        return (None, None)
+
+    addr = gateway.split('%')[0]
+    solicit_ipv6_neighbors(interface)
+    for mac, addrs in get_ipv6_neighbor_map(interface).items():
+        if addr in addrs:
+            return (addr, mac)
+    return (addr, None)
+
+
+def sniff_ipv6_addresses(interface, duration=4):
+    """
+    Passively sniffs IPv6 traffic for `duration` seconds and returns
+    {mac: [ipv6 source addresses]} seen on the wire. Catches routable and
+    temporary (privacy) addresses the neighbor cache alone often misses.
+    """
+    from scapy.all import sniff, IPv6, Ether  # pylint: disable=no-name-in-module
+    found = {}
+
+    def _handle(pkt):
+        try:
+            if pkt.haslayer(IPv6) and pkt.haslayer(Ether):
+                mac = _normalize_mac(pkt[Ether].src)
+                src = pkt[IPv6].src
+                if src and src != '::':
+                    found.setdefault(mac, [])
+                    if src not in found[mac]:
+                        found[mac].append(src)
+        except Exception:
+            pass
+
+    try:
+        sniff(iface=interface, timeout=duration, store=False, prn=_handle,
+              lfilter=lambda p: p.haslayer(IPv6))
+    except Exception:
+        pass
+    return found

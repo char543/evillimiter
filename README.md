@@ -20,20 +20,39 @@ EvilLimiter has been updated to support macOS alongside Linux. The macOS impleme
 
 ## Installation
 
-1. **Install python, pip & dependencies:**
+1. **Install Python:**
 
    ```bash
-   brew install python pipx
-   pipx ensurepath
+   brew install python
    ```
 
-2. **Install the package:**
+2. **Clone into a folder macOS does _not_ protect:**
 
-   Clone the repo then:
+   This tool runs as **root**, and macOS (TCC / System Integrity Protection)
+   blocks root from reading certain folders. If the project — or its Python
+   virtualenv — lives in a protected folder, `sudo` fails with
+   `Operation not permitted`.
+
+   **Avoid** these locations: `~/Downloads`, `~/Desktop`, `~/Documents`,
+   iCloud Drive, and external or network volumes.
+
+   **Use** a plain folder under your home directory instead, for example:
 
    ```bash
-   cd evillimiter
-   pipx install .
+   # any of these are fine (not TCC-protected):
+   #   ~/evillimiter        ~/src/evillimiter        ~/dev/evillimiter
+   git clone https://github.com/<you>/evillimiter.git ~/evillimiter
+   cd ~/evillimiter
+   ```
+
+3. **Create a project-local virtualenv and install dependencies:**
+
+   Keeping the venv inside the project folder (not under `~/Library`) is what
+   lets `sudo` run it without hitting TCC.
+
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
    ```
 
 ## macOS-Specific Features
@@ -58,15 +77,20 @@ EvilLimiter has been updated to support macOS alongside Linux. The macOS impleme
 
 ## Usage
 
-The usage is identical to the Linux version:
+Run from the project folder using the virtualenv's Python:
 
 ```bash
 # Run with administrator privileges
-sudo evillimiter
+sudo PYTHONDONTWRITEBYTECODE=1 .venv/bin/python bin/evillimiter
 
-# Or with specific interface
-sudo evillimiter -i en0
+# Or with a specific interface
+sudo PYTHONDONTWRITEBYTECODE=1 .venv/bin/python bin/evillimiter -i en0
 ```
+
+`PYTHONDONTWRITEBYTECODE=1` stops Python from writing `.pyc` cache files as
+root inside the virtualenv. Without it, root-owned cache files accumulate and
+later break `pip` with `Permission denied`. `sudo` drops environment variables
+by default, so the variable is set inline, before the command.
 
 ## Platform Differences
 
@@ -86,10 +110,17 @@ sudo evillimiter -i en0
    - Ensure you're running on a supported macOS version
    - Check that system utilities are in standard locations (/usr/bin, /sbin, etc.)
 
-2. **Permission denied:**
+2. **Permission denied / Operation not permitted:**
 
-   - EvilLimiter requires root privileges on macOS
-   - Run with `sudo`
+   - EvilLimiter requires root privileges on macOS, so run it with `sudo`
+   - `Operation not permitted` under `sudo` means the project or its virtualenv
+     sits in a TCC-protected folder (`~/Downloads`, `~/Desktop`, `~/Documents`,
+     iCloud, external/network volumes). Move it to a plain home folder such as
+     `~/evillimiter` (see Installation)
+   - `Permission denied` from `pip`/`pipx` usually means an earlier `sudo` run
+     left root-owned `.pyc` files in the virtualenv. Delete the venv with
+     `sudo rm -rf .venv`, recreate it, and always launch with
+     `PYTHONDONTWRITEBYTECODE=1` (see Usage)
 
 3. **pfctl errors:**
 

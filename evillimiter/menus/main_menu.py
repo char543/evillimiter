@@ -16,6 +16,7 @@ from evillimiter.console.banner import get_main_banner
 from evillimiter.networking.host import Host
 from evillimiter.networking.limit import create_limiter, Direction
 from evillimiter.networking.spoof import ARPSpoofer
+from evillimiter.networking.ndp_spoof import NDPSpoofer
 from evillimiter.networking.dns_server import SimpleDNSServer
 from evillimiter.networking.scan import HostScanner
 from evillimiter.networking.monitor import BandwidthMonitor
@@ -91,6 +92,8 @@ class MainMenu(CommandMenu):
 
         self.host_scanner = HostScanner(self.interface, self.iprange)
         self.arp_spoofer = ARPSpoofer(self.interface, self.gateway_ip, self.gateway_mac)
+        gateway_ipv6, gateway_mac6 = netutils.get_gateway_ipv6(self.interface)
+        self.ndp_spoofer = NDPSpoofer(self.interface, gateway_ipv6, gateway_mac6, self.arp_spoofer.our_mac)
         self.dns_server = None  # Will be initialized when DNS redirection is needed
         self.limiter = create_limiter(self.interface)
         self.bandwidth_monitor = BandwidthMonitor(self.interface, 1)
@@ -104,6 +107,9 @@ class MainMenu(CommandMenu):
 
         # start the spoof thread
         self.arp_spoofer.start()
+        # start the IPv6 (NDP) spoof thread if an IPv6 gateway was found
+        if self.ndp_spoofer.start():
+            IO.ok('ipv6 interception active (gateway {}).'.format(self.ndp_spoofer.gateway_ipv6))
         # start the bandwidth monitor thread
         self.bandwidth_monitor.start()
         # start the host watch thread
@@ -116,6 +122,7 @@ class MainMenu(CommandMenu):
         IO.ok('cleaning up... stand by...')
 
         self.arp_spoofer.stop()
+        self.ndp_spoofer.stop()
         self.bandwidth_monitor.stop()
         
         if self.dns_server:
@@ -171,7 +178,8 @@ class MainMenu(CommandMenu):
             '{}IP address{}'.format(IO.Style.BRIGHT, IO.Style.RESET_ALL),
             '{}MAC address{}'.format(IO.Style.BRIGHT, IO.Style.RESET_ALL),
             '{}Hostname{}'.format(IO.Style.BRIGHT, IO.Style.RESET_ALL),
-            '{}Status{}'.format(IO.Style.BRIGHT, IO.Style.RESET_ALL)
+            '{}Status{}'.format(IO.Style.BRIGHT, IO.Style.RESET_ALL),
+            '{}IPv6{}'.format(IO.Style.BRIGHT, IO.Style.RESET_ALL)
         ]]
         
         with self.hosts_lock:
@@ -181,7 +189,8 @@ class MainMenu(CommandMenu):
                     host.ip,
                     host.mac,
                     host.name,
-                    host.pretty_status()
+                    host.pretty_status(),
+                    '\n'.join(host.ipv6) if host.ipv6 else '-'
                 ])
 
         table = SingleTable(table_data, 'Hosts')
@@ -213,6 +222,7 @@ class MainMenu(CommandMenu):
 
         for host in hosts:
             self.arp_spoofer.add(host)
+            self.ndp_spoofer.add(host)
             self.limiter.limit(host, direction, rate)
             self.bandwidth_monitor.add(host)
 
@@ -233,6 +243,7 @@ class MainMenu(CommandMenu):
                 if not host.spoofed:
                     self.arp_spoofer.add(host)
 
+                self.ndp_spoofer.add(host)
                 self.limiter.block(host, direction)
                 self.bandwidth_monitor.add(host)
                 IO.ok('{}{}{r} {} {}blocked{r}.'.format(
@@ -707,6 +718,8 @@ class MainMenu(CommandMenu):
 
         self.arp_spoofer.remove(old_host, restore=False)
         self.arp_spoofer.add(new_host)
+        self.ndp_spoofer.remove(old_host, restore=False)
+        self.ndp_spoofer.add(new_host)
 
         self.host_watcher.remove(old_host)
         self.host_watcher.add(new_host)
@@ -835,7 +848,23 @@ class MainMenu(CommandMenu):
         return ret
 
     def _print_help_reminder(self):
-        IO.print('type {Y}help{R} or {Y}?{R} to show command information.'.format(Y=IO.Fore.LIGHTYELLOW_EX, R=IO.Style.RESET_ALL))
+        Y = IO.Fore.LIGHTYELLOW_EX
+        R = IO.Style.RESET_ALL
+        B = IO.Style.BRIGHT
+
+        rows = [
+            ('scan',          'find devices on the network'),
+            ('hosts',         'list what was found, with their IDs'),
+            ('limit 3 1mbit', 'throttle host #3 to 1 mbit/s'),
+            ('block 3',       'cut host #3 off the internet'),
+            ('free 3',        'remove all limits/blocks from host #3'),
+            ('help  or  ?',   'full command reference'),
+        ]
+        lines = ['{B}quick start:{R}'.format(B=B, R=R)]
+        for cmd, desc in rows:
+            pad = ' ' * max(2, 18 - len(cmd))
+            lines.append('  {Y}{cmd}{R}{pad}{desc}'.format(Y=Y, R=R, cmd=cmd, pad=pad, desc=desc))
+        IO.print('\n'.join(lines))
 
     def _get_hosts_by_ids(self, ids_string):
         if ids_string == 'all':
@@ -950,6 +979,7 @@ class MainMenu(CommandMenu):
         """
         if host.spoofed:
             self.arp_spoofer.remove(host)
+            self.ndp_spoofer.remove(host)
             self.limiter.unlimit(host, Direction.BOTH)
             self.bandwidth_monitor.remove(host)
             self.host_watcher.remove(host)

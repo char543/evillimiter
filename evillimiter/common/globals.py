@@ -14,6 +14,7 @@ if IS_MACOS:
     BIN_SYSCTL = shell.locate_bin('sysctl')
     BIN_IFCONFIG = shell.locate_bin('ifconfig')
     IP_FORWARD_LOC = 'net.inet.ip.forwarding'
+    IP6_FORWARD_LOC = 'net.inet6.ip6.forwarding'
     
     # For compatibility
     BIN_TC = None
@@ -24,6 +25,7 @@ else:
     BIN_IPTABLES = shell.locate_bin('iptables')
     BIN_SYSCTL = shell.locate_bin('sysctl')
     IP_FORWARD_LOC = 'net.ipv4.ip_forward'
+    IP6_FORWARD_LOC = 'net.ipv6.conf.all.forwarding'
     
     # For compatibility
     BIN_PFCTL = None
