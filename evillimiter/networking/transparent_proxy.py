@@ -53,88 +53,52 @@ class TransparentProxy:
         self.redirect_rules[host_ip] = target_url
         print(f"DEBUG: Added redirect rule: {host_ip} -> {target_url}")
 
-    def setup_redirection(self, host_ip, local_ip, portal_url=None, include_http=True, block_ipv6=None, harden=False, lockdown=False, doh_ips=None):
-        """Install pf rdr rules so the host\'s DNS (and optionally HTTP) is sent
-        to us, and register the host\'s HTTP target (None => built-in page).
-
-        HTTPS is intentionally left alone: TLS cannot be transparently
-        intercepted without a trusted certificate, so real captive portals
-        never redirect 443.
+    def install_enforcement(self, host_ip, block_ipv6=None, harden=False, lockdown=False, doh_ips=None, allow_ips=None):
         """
-        self.redirect_rules[host_ip] = portal_url
+        Install the pf rules that make DNS injection stick. Redirection itself is
+        done by injecting forged DNS answers (see DNSInjector); these rules only
+        *block* the target's escape routes. No rdr, no proxy.
 
-        # On macOS, pf rdr must point forwarded traffic at 127.0.0.1 to be
-        # delivered to a local socket. Redirecting to our LAN IP increments the
-        # rdr counter but the packet never reaches the listening server.
-        rdr_target = '127.0.0.1'
-        rules = [
-            f"rdr pass on {self.interface} inet proto udp from {host_ip} to any port 53 -> {rdr_target} port 5354",
-            f"rdr pass on {self.interface} inet proto tcp from {host_ip} to any port 53 -> {rdr_target} port 5354",
-        ]
-        if include_http:
-            rules.append(f"rdr pass on {self.interface} inet proto tcp from {host_ip} to any port 80 -> {rdr_target} port {self.port}")
+          force-IPv4 : block the host's routable IPv6 so it can't resolve/connect over v6
+          --harden   : block DoT (853) and known DoH resolver IPs -> fall back to plain DNS
+          --lockdown : allow only DNS, DHCP and the redirect target(s); block everything else
+        """
+        rules = []
 
-        # A forwarded packet rewritten by rdr must be routed onto loopback to be
-        # delivered to our local socket; without route-to lo0 the rdr rule counts
-        # the packet but it never reaches the listening server.
-        rules.append(f"pass in quick on {self.interface} route-to (lo0 127.0.0.1) inet proto udp from {host_ip} to any port 53")
-        rules.append(f"pass in quick on {self.interface} route-to (lo0 127.0.0.1) inet proto tcp from {host_ip} to any port 53")
-        if include_http:
-            rules.append(f"pass in quick on {self.interface} route-to (lo0 127.0.0.1) inet proto tcp from {host_ip} to any port 80")
-
-        # Force IPv4: block the target\'s IPv6 so it can\'t bypass our IPv4 DNS.
-        # rdr (translation) rules must precede block (filter) rules in a pf ruleset.
         for addr in (block_ipv6 or []):
             rules.append(f"block return out quick on {self.interface} inet6 from {addr}")
             rules.append(f"block return in quick on {self.interface} inet6 to {addr}")
 
         if lockdown:
-            # Captive lockdown. Explicitly allow all traffic between the host and
-            # us (the rdr above rewrites its DNS/HTTP destination to our IP), allow
-            # DHCP so the lease survives, then block everything else. The explicit
-            # host<->us pass is what keeps the catch-all block from eating the
-            # redirected DNS/HTTP.
-            rules.append(f"pass quick on {self.interface} inet from {host_ip} to {local_ip}")
-            rules.append(f"pass quick on {self.interface} inet from {local_ip} to {host_ip}")
+            for aip in (allow_ips or []):
+                rules.append(f"pass out quick on {self.interface} inet from {host_ip} to {aip}")
+            rules.append(f"pass out quick on {self.interface} inet proto udp from {host_ip} to any port 53")
             rules.append(f"pass out quick on {self.interface} inet proto udp from {host_ip} to any port 67")
             rules.append(f"pass out quick on {self.interface} inet proto udp from {host_ip} to any port 68")
             rules.append(f"block return out quick on {self.interface} inet from {host_ip}")
         elif harden:
-            # Push encrypted DNS back to plain port 53 (which we capture), without
-            # cutting the rest of the device's connectivity.
             rules.append(f"block return out quick on {self.interface} inet proto tcp from {host_ip} to any port 853")
             rules.append(f"block return out quick on {self.interface} inet proto udp from {host_ip} to any port 853")
             for ip in (doh_ips or []):
                 rules.append(f"block return out quick on {self.interface} inet proto tcp from {host_ip} to {ip} port 443")
                 rules.append(f"block return out quick on {self.interface} inet proto tcp from {host_ip} to {ip} port 853")
 
-        # Write rules to temp file
+        if not rules:
+            return  # plain --dns with no harden/lockdown: injection alone, nothing to block
+
         fd, rules_file = tempfile.mkstemp()
         os.close(fd)
-
         try:
             with open(rules_file, 'w') as f:
                 f.write('\n'.join(rules) + '\n')
-                
-            print("DEBUG: Generated rules:")
+            print("DEBUG: enforcement rules:")
             print('\n'.join(rules))
-            
-            print("\nDEBUG: Loading rules...")
-            # Enable PF if needed
             shell.execute_suppressed(f'{BIN_PFCTL} -e')
-            
-            # Load rules exactly as portal did
-            # Load WITHOUT suppressing errors so a bad ruleset is visible
-            proc = subprocess.run([BIN_PFCTL, '-f', rules_file],
-                                  capture_output=True, text=True)
+            proc = subprocess.run([BIN_PFCTL, '-f', rules_file], capture_output=True, text=True)
             if proc.returncode != 0:
                 print(f"DEBUG: pfctl -f FAILED (exit {proc.returncode}): {proc.stderr.strip()}")
             else:
-                show = subprocess.run([BIN_PFCTL, '-s', 'nat'],
-                                      capture_output=True, text=True)
-                active = '\n'.join(l for l in show.stdout.splitlines() if 'rdr' in l) or '(none)'
-                print(f"DEBUG: pfctl -f OK; active rdr rules:\n{active}")
-                
+                print("DEBUG: pfctl enforcement loaded")
         finally:
             if os.path.exists(rules_file):
                 os.unlink(rules_file)

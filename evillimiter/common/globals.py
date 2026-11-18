@@ -47,3 +47,13 @@ DOH_CANARY_DOMAINS = [
     'mask.icloud.com',           # Apple iCloud Private Relay
     'mask-h2.icloud.com',        # Apple iCloud Private Relay
 ]
+
+
+# OS connectivity-check domains. In catch-all (--to) redirection these are left
+# to resolve normally so the device does not pop its captive-portal sheet.
+CAPTIVE_CHECK_DOMAINS = [
+    'captive.apple.com', 'captive.g.aaplimg.com',
+    'connectivitycheck.gstatic.com', 'connectivitycheck.android.com',
+    'clients3.google.com', 'www.google.com',
+    'www.msftconnecttest.com', 'www.msftncsi.com', 'dns.msftncsi.com',
+]

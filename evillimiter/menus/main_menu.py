@@ -15,10 +15,10 @@ from evillimiter.console.chart import BarChart
 from evillimiter.console.banner import get_main_banner
 from evillimiter.networking.host import Host
 from evillimiter.networking.limit import create_limiter, Direction
-from evillimiter.common.globals import DOH_RESOLVER_IPS, DOH_CANARY_DOMAINS
+from evillimiter.common.globals import DOH_RESOLVER_IPS, DOH_CANARY_DOMAINS, CAPTIVE_CHECK_DOMAINS
 from evillimiter.networking.spoof import ARPSpoofer
 from evillimiter.networking.ndp_spoof import NDPSpoofer
-from evillimiter.networking.dns_server import SimpleDNSServer
+from evillimiter.networking.dns_inject import DNSInjector
 from evillimiter.networking.scan import HostScanner
 from evillimiter.networking.monitor import BandwidthMonitor
 from evillimiter.networking.watch import HostWatcher
@@ -97,7 +97,7 @@ class MainMenu(CommandMenu):
         self.arp_spoofer = ARPSpoofer(self.interface, self.gateway_ip, self.gateway_mac)
         gateway_ipv6, gateway_mac6 = netutils.get_gateway_ipv6(self.interface)
         self.ndp_spoofer = NDPSpoofer(self.interface, gateway_ipv6, gateway_mac6, self.arp_spoofer.our_mac)
-        self.dns_server = None  # Will be initialized when DNS redirection is needed
+        self.dns_injector = DNSInjector(self.interface)
         self.limiter = create_limiter(self.interface)
         self.bandwidth_monitor = BandwidthMonitor(self.interface, 1)
         self.host_watcher = HostWatcher(self.host_scanner, self._reconnect_callback)
@@ -128,8 +128,7 @@ class MainMenu(CommandMenu):
         self.ndp_spoofer.stop()
         self.bandwidth_monitor.stop()
         
-        if self.dns_server:
-            self.dns_server.stop()
+        self.dns_injector.stop()
 
         for host in self.hosts:
             self._free_host(host)
@@ -561,176 +560,84 @@ class MainMenu(CommandMenu):
         else:
             IO.error('{}{}{} is an invalid settings attribute.'.format(IO.Fore.LIGHTYELLOW_EX, args.attribute, IO.Style.RESET_ALL))
 
-    def _portal_handler(self, args):
-        """
-        DEPRECATED: Use 'redirect' command instead.
-        This will be removed in a future version.
-        """
-        action = args.action.lower()
-        
-        if action == 'enable':
-            hosts = self._get_hosts_by_ids(args.id)
-            if hosts is None or len(hosts) == 0:
-                return
-                
-            # Get redirect IP (default to gateway IP)
-            redirect_ip = args.redirect_ip if args.redirect_ip else self.gateway_ip
-            if not netutils.validate_ip_address(redirect_ip):
-                IO.error('invalid redirect IP address.')
-                return
-                
-            # Initialize DNS server if not already done
-            if not self.dns_server:
-                self.dns_server = SimpleDNSServer()
-                self.dns_server.set_redirect_ip(redirect_ip)
-                self.dns_server.start()
-            else:
-                # Update redirect IP
-                self.dns_server.set_redirect_ip(redirect_ip)
-                
-            # Add hosts to DNS redirection and ARP spoofer
-            for host in hosts:
-                if not host.spoofed:
-                    self.arp_spoofer.add(host)
-                # Add pfctl rule to redirect DNS traffic from this host
-                self.limiter._generate_dns_redirect_rules(host, '127.0.0.1')
-                IO.ok('{}{}{} redirected to captive portal at {}{}{}.'.format(
-                    IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL,
-                    IO.Fore.LIGHTGREEN_EX, redirect_ip, IO.Style.RESET_ALL
-                ))
-                
-        elif action == 'disable':
-            hosts = self._get_hosts_by_ids(args.id)
-            if hosts is None or len(hosts) == 0:
-                return
-                
-            if not self.dns_server:
-                IO.error('captive portal is not enabled.')
-                return
-                
-            # Remove hosts from DNS redirection (would need to implement host-specific rule removal)
-            for host in hosts:
-                # For now, just notify - implementing selective rule removal would require more complex logic
-                IO.ok('{}{}{} removed from captive portal.'.format(
-                    IO.Fore.LIGHTYELLOW_EX, host.ip, IO.Style.RESET_ALL
-                ))
-                
-        else:
-            IO.error('invalid action. use "enable" or "disable".')
-
     def _redirect_handler(self, args):
-        """Handle redirect command with options:
-        redirect <id>                          # Default: redirect to local proxy
-        redirect <id> --to <ip|domain>        # Redirect all traffic to IP or domain
-        redirect <id> --dns <domain>=<ip>     # Domain-specific redirection
+        """Redirect a host's DNS by injection (macOS-reliable, no pf rdr):
+        redirect <id> --dns <domain>=<ip>   map one domain to an IP
+        redirect <id> --to <ip|domain>      map every domain to this target
+        optional: --harden (force plain DNS), --lockdown (allow only the target)
         """
         hosts = self._get_hosts_by_ids(args.id)
         if hosts is None or len(hosts) == 0:
             return
-            
-        # Parse arguments
-        target_ip = None
+
         dns_mappings = None
-        
-        if hasattr(args, 'to') and args.to:
-            target = args.to
-            # Clean up the target (remove http://, https://, trailing slashes)
-            target = target.lower()
-            target = target.replace('http://', '').replace('https://', '')
-            target = target.split('/')[0]  # Remove paths
-            
-            if netutils.validate_ip_address(target):
-                target_ip = target
-            else:
-                # It's a domain, try to resolve it
-                try:
-                    addr_info = socket.getaddrinfo(target, None)
-                    target_ip = addr_info[0][4][0]  # Get first IPv4 address
-                except (socket.gaierror, IndexError):
-                    IO.error(f'Could not resolve domain: {target}')
-                    return
-            
-        if hasattr(args, 'dns') and args.dns:
+        catch_all_ip = None
+
+        if getattr(args, 'dns', None):
             try:
                 domain, ip = args.dns.split('=')
-                if not netutils.validate_ip_address(ip):
-                    IO.error('Invalid DNS mapping IP address')
-                    return
-                dns_mappings = {domain: ip}
             except ValueError:
-                IO.error("Invalid --dns format. Use: --dns domain=ip")
+                IO.error('invalid --dns format. use: --dns domain=ip')
                 return
-
-        # Resolve our own IPv4 on the interface (portal / rdr target)
-        local_ip = netutils.get_local_ip_address(self.interface)
-        if local_ip is None:
-            IO.error('could not determine local IPv4 address for {}.'.format(self.interface))
+            domain, ip = domain.strip(), ip.strip()
+            if not netutils.validate_ip_address(ip):
+                IO.error('invalid --dns mapping IP address.')
+                return
+            dns_mappings = {domain: ip}
+        elif getattr(args, 'to', None):
+            target = args.to.lower().replace('http://', '').replace('https://', '').split('/')[0]
+            if netutils.validate_ip_address(target):
+                catch_all_ip = target
+            else:
+                try:
+                    catch_all_ip = socket.getaddrinfo(target, None, socket.AF_INET)[0][4][0]
+                except (socket.gaierror, IndexError):
+                    IO.error('could not resolve --to target: {}'.format(target))
+                    return
+        else:
+            IO.error('specify a redirect: --dns domain=ip  or  --to <ip|domain>')
             return
 
-        # Single DNS server bound to 0.0.0.0:5354
-        if not self.dns_server:
-            self.dns_server = SimpleDNSServer(port=5354)
-            if not self.dns_server.start():
-                IO.error('failed to start DNS server (is port 5354 already in use?).')
-                return
-
-        # Decide redirection mode from the arguments
-        if dns_mappings:
-            # selective: map given domains, resolve everything else normally
-            self.dns_server.catch_all = False
-            for domain, ip in dns_mappings.items():
-                self.dns_server.add_domain_mapping(domain, ip)
-            portal_url = None
-            include_http = False
-        else:
-            # captive-portal: DNS answers everything with us; HTTP 302 to portal
-            self.dns_server.catch_all = True
-            self.dns_server.set_redirect_ip(local_ip)
-            if getattr(args, 'to', None):
-                portal_url = args.to if args.to.startswith(('http://', 'https://')) else 'http://' + args.to
-                # allow the portal's own host to resolve for real so the 302 target loads
-                try:
-                    from urllib.parse import urlparse
-                    portal_host = urlparse(portal_url).hostname
-                    if portal_host and not netutils.validate_ip_address(portal_host):
-                        self.dns_server.add_allow(portal_host)
-                except Exception:
-                    pass
-            else:
-                portal_url = None  # proxy serves its built-in page
-            include_http = True
-
-        # Hardening ladder: --harden pushes encrypted DNS back to plain DNS;
-        # --lockdown blocks everything except our DNS + portal (implies harden).
         lockdown = bool(getattr(args, 'lockdown', False))
         harden = lockdown or bool(getattr(args, 'harden', False))
         doh_ips = DOH_RESOLVER_IPS if harden else None
+        mode = ' [lockdown]' if lockdown else ' [harden]' if harden else ''
+
+        # Configure and start the DNS injector
+        self.dns_injector.start()
+        if dns_mappings:
+            for d, ip in dns_mappings.items():
+                self.dns_injector.set_mapping(d, ip)
+            self.dns_injector.clear_catch_all()
+            allow_ips = list(dns_mappings.values())
+        else:
+            self.dns_injector.set_catch_all(catch_all_ip)
+            for _probe in CAPTIVE_CHECK_DOMAINS:
+                self.dns_injector.add_allow(_probe)
+            allow_ips = [catch_all_ip]
         if harden:
             for _canary in DOH_CANARY_DOMAINS:
-                self.dns_server.add_deny(_canary)
+                self.dns_injector.add_deny(_canary)
 
         for host in hosts:
             if not host.spoofed:
                 self.arp_spoofer.add(host)
             self.ndp_spoofer.add(host)
+            self.dns_injector.add_target(host)
 
             try:
                 _, routable6 = netutils.split_ipv6_addresses(host.ipv6)
-                self.limiter.proxy.setup_redirection(host.ip, local_ip, portal_url, include_http,
-                                                     block_ipv6=routable6, harden=harden,
-                                                     lockdown=lockdown, doh_ips=doh_ips)
+                self.limiter.proxy.install_enforcement(
+                    host.ip, block_ipv6=routable6, harden=harden,
+                    lockdown=lockdown, doh_ips=doh_ips, allow_ips=allow_ips)
 
                 if dns_mappings:
-                    domain = list(dns_mappings.keys())[0]
-                    ip = dns_mappings[domain]
-                    IO.ok('{}{}{r} DNS: {} -> {}.'.format(
-                        IO.Fore.LIGHTYELLOW_EX, host.ip, domain, ip, r=IO.Style.RESET_ALL))
-                elif portal_url:
-                    IO.ok('{}{}{r} redirected to portal {}.'.format(
-                        IO.Fore.LIGHTYELLOW_EX, host.ip, portal_url, r=IO.Style.RESET_ALL))
+                    d = list(dns_mappings.keys())[0]
+                    IO.ok('{}{}{r} DNS {} -> {}{}.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, d, dns_mappings[d], mode, r=IO.Style.RESET_ALL))
                 else:
-                    IO.ok('{}{}{r} redirected to the built-in portal page.'.format(
-                        IO.Fore.LIGHTYELLOW_EX, host.ip, r=IO.Style.RESET_ALL))
+                    IO.ok('{}{}{r} all DNS -> {}{}.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, catch_all_ip, mode, r=IO.Style.RESET_ALL))
             except Exception as e:
                 IO.error('failed to set up redirection for {}: {}'.format(host.ip, e))
 
@@ -962,7 +869,7 @@ class MainMenu(CommandMenu):
         elif domains_only:
             # Mix of both - add domains_only with default IP
             for domain in domains_only:
-                mappings[domain] = self.dns_server.redirect_ip if self.dns_server else self.gateway_ip
+                mappings[domain] = self.gateway_ip
                 
         return mappings if mappings else domains_only
 
@@ -982,6 +889,7 @@ class MainMenu(CommandMenu):
         if host.spoofed:
             self.arp_spoofer.remove(host)
             self.ndp_spoofer.remove(host)
+            self.dns_injector.remove_target(host)
             self.limiter.unlimit(host, Direction.BOTH)
             self.bandwidth_monitor.remove(host)
             self.host_watcher.remove(host)

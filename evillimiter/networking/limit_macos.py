@@ -23,8 +23,7 @@ class MacOSLimiter(object):
         self._rules_file = None
         self._active_rules = []  # Keep track of all active rules
         self._dns_rules = {}  # Keep track of DNS redirect rules per host
-        self.proxy = TransparentProxy(interface=interface, port=8080)
-        self.proxy.start()
+        self.proxy = TransparentProxy(interface=interface, port=8080)  # pf enforcement helper; HTTP server not started
 
     def limit(self, host, direction, rate):
         """
