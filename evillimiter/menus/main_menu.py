@@ -77,6 +77,7 @@ class MainMenu(CommandMenu):
         redirect_parser.add_parameterized_flag('--dns', 'dns')
         redirect_parser.add_flag('--harden', 'harden')
         redirect_parser.add_flag('--lockdown', 'lockdown')
+        redirect_parser.add_flag('--mitm', 'mitm')
 
         self.parser.add_subparser('help', self._help_handler)
         self.parser.add_subparser('?', self._help_handler)
@@ -98,6 +99,7 @@ class MainMenu(CommandMenu):
         gateway_ipv6, gateway_mac6 = netutils.get_gateway_ipv6(self.interface)
         self.ndp_spoofer = NDPSpoofer(self.interface, gateway_ipv6, gateway_mac6, self.arp_spoofer.our_mac)
         self.dns_injector = DNSInjector(self.interface)
+        self.mitm_proxy = None  # lazily started by redirect --mitm
         self.limiter = create_limiter(self.interface)
         self.bandwidth_monitor = BandwidthMonitor(self.interface, 1)
         self.host_watcher = HostWatcher(self.host_scanner, self._reconnect_callback)
@@ -129,6 +131,8 @@ class MainMenu(CommandMenu):
         self.bandwidth_monitor.stop()
         
         self.dns_injector.stop()
+        if self.mitm_proxy:
+            self.mitm_proxy.stop()
 
         for host in self.hosts:
             self._free_host(host)
@@ -560,6 +564,24 @@ class MainMenu(CommandMenu):
         else:
             IO.error('{}{}{} is an invalid settings attribute.'.format(IO.Fore.LIGHTYELLOW_EX, args.attribute, IO.Style.RESET_ALL))
 
+    def _mitm_event(self, e):
+        kind = e.get('event')
+        if kind == 'request':
+            IO.print('{Y}[mitm]{R} {s}://{h} {m} {p}'.format(
+                Y=IO.Fore.LIGHTGREEN_EX, R=IO.Style.RESET_ALL,
+                s=e.get('scheme'), h=e.get('host'), m=e.get('method'), p=e.get('path')))
+        elif kind == 'bind_error':
+            IO.error('mitm bind failed on port {}: {}'.format(e.get('port'), e.get('error')))
+
+    def _ensure_mitm(self):
+        if self.mitm_proxy is None:
+            from evillimiter.networking.mitm_proxy import MITMProxy
+            self.mitm_proxy = MITMProxy(on_event=self._mitm_event)
+            self.mitm_proxy.start()
+            IO.ok('mitm proxy listening on :80 and :443')
+            IO.ok('install this CA on strict clients: {}{}{}'.format(
+                IO.Fore.LIGHTYELLOW_EX, self.mitm_proxy.ca.ca_cert_path, IO.Style.RESET_ALL))
+
     def _redirect_handler(self, args):
         """Redirect a host's DNS by injection (macOS-reliable, no pf rdr):
         redirect <id> --dns <domain>=<ip>   map one domain to an IP
@@ -572,8 +594,16 @@ class MainMenu(CommandMenu):
 
         dns_mappings = None
         catch_all_ip = None
+        mitm = bool(getattr(args, 'mitm', False))
 
-        if getattr(args, 'dns', None):
+        if mitm:
+            local_ip = netutils.get_local_ip_address(self.interface)
+            if local_ip is None:
+                IO.error('could not determine local IPv4 address for {}.'.format(self.interface))
+                return
+            catch_all_ip = local_ip
+            self._ensure_mitm()
+        elif getattr(args, 'dns', None):
             try:
                 domain, ip = args.dns.split('=')
             except ValueError:
@@ -595,13 +625,13 @@ class MainMenu(CommandMenu):
                     IO.error('could not resolve --to target: {}'.format(target))
                     return
         else:
-            IO.error('specify a redirect: --dns domain=ip  or  --to <ip|domain>')
+            IO.error('specify a redirect: --mitm, --dns domain=ip, or --to <ip|domain>')
             return
 
         lockdown = bool(getattr(args, 'lockdown', False))
         harden = lockdown or bool(getattr(args, 'harden', False))
         doh_ips = DOH_RESOLVER_IPS if harden else None
-        mode = ' [lockdown]' if lockdown else ' [harden]' if harden else ''
+        mode = ' [mitm]' if mitm else ' [lockdown]' if lockdown else ' [harden]' if harden else ''
 
         # Configure and start the DNS injector
         self.dns_injector.start()
@@ -635,6 +665,9 @@ class MainMenu(CommandMenu):
                     d = list(dns_mappings.keys())[0]
                     IO.ok('{}{}{r} DNS {} -> {}{}.'.format(
                         IO.Fore.LIGHTYELLOW_EX, host.ip, d, dns_mappings[d], mode, r=IO.Style.RESET_ALL))
+                elif mitm:
+                    IO.ok('{}{}{r} intercepting (DNS -> {}){}.'.format(
+                        IO.Fore.LIGHTYELLOW_EX, host.ip, catch_all_ip, mode, r=IO.Style.RESET_ALL))
                 else:
                     IO.ok('{}{}{r} all DNS -> {}{}.'.format(
                         IO.Fore.LIGHTYELLOW_EX, host.ip, catch_all_ip, mode, r=IO.Style.RESET_ALL))
@@ -689,12 +722,12 @@ class MainMenu(CommandMenu):
              ['limit 4 100kbit', 'limit 2,3 1mbit --download', 'limit all 200kbit']),
             ('block [IDs] (--upload|--download)', 'cut a host off the internet (IPv4 and IPv6).',
              ['block 2', 'block all']),
-            ('redirect [IDs] (--dns d=IP) (--to IP|URL) (--harden) (--lockdown)',
-             'capture host DNS and HTTP; see redirect modes below.',
+            ('redirect [IDs] (--dns d=IP) (--to IP) (--mitm) (--harden) (--lockdown)',
+             'redirect or intercept a host (see redirect modes below).',
              ['redirect 2 --dns google.com=66.254.114.41',
-              'redirect 2 --dns ads.example=1.2.3.4 --harden',
-              'redirect 2 --to http://portal.local/',
-              'redirect 2 --lockdown']),
+              'redirect 2 --to 66.254.114.41 --harden',
+              'redirect 2 --mitm --harden',
+              'redirect 2 --mitm --lockdown']),
             ('free [IDs]', 'remove every limit, block and redirect from a host.',
              ['free 3,4', 'free all']),
             ('add [IP] (--mac MAC)', 'add a host to the list manually.', ['add 192.168.0.24']),
@@ -719,19 +752,18 @@ class MainMenu(CommandMenu):
         out += [
             f'{B}Redirect modes{R}',
             '',
-            f'  {Y}--dns d=IP{R}   point one domain at an IP for this host; everything else',
-            '               resolves normally. forces IPv4 so it cannot leak over v6.',
-            f'  {Y}--to IP|URL{R}  send a 302 to this target for the host HTTP (port 80).',
-            f'  {Y}(no flag){R}    serve the built-in portal page on HTTP.',
-            f'  {Y}--harden{R}     also block DoT (853) and known DoH resolver IPs, and answer',
-            '               the Firefox / Apple Private Relay canaries with NXDOMAIN, so the',
-            '               host falls back to the plain DNS you control. internet still works.',
-            f'  {Y}--lockdown{R}   block everything except your DNS and portal (implies --harden);',
-            '               herds the host to a captive portal, like Cisco / UniFi.',
+            f'  {Y}--dns d=IP{R}   resolve one domain to an IP for this host (DNS injection);',
+            '               everything else resolves normally, forced onto IPv4.',
+            f'  {Y}--to IP{R}      resolve every domain for this host to one IP.',
+            f'  {Y}--mitm{R}       intercept the host HTTPS/HTTP: on-the-fly certs from a local',
+            '               CA, terminate TLS, relay to the real site, log every request.',
+            f'  {Y}--harden{R}     block DoT (853) + known DoH resolver IPs and NXDOMAIN the',
+            '               Private Relay / DoH canaries, forcing plain DNS we control.',
+            f'  {Y}--lockdown{R}   allow only DNS, DHCP and the redirect target; block the rest.',
             '',
-            f'  {B}note{R}: HTTPS content cannot be swapped without a trusted cert on the device.',
-            '        redirect controls DNS and plain HTTP. an HTTPS site whose domain is',
-            '        pointed elsewhere shows a certificate error, not the new content.',
+            f'  {B}note{R}: --mitm intercepts clients that trust our CA (install it from the path',
+            '        printed when it starts) or that do not strictly validate. A strict browser',
+            '        on a pinned/preloaded site still needs the CA installed on the device.',
             '',
         ]
         IO.print('\n'.join(out))

@@ -16,17 +16,26 @@ EvilLimiter has been updated to support macOS alongside Linux. The macOS impleme
 | Feature | Status |
 | ------- | ------ |
 | Host discovery (`scan`, `hosts`), including IPv6 | Working |
-| Bandwidth limiting (`limit`, IPv4 and IPv6) | Working |
+| Bandwidth limiting (`limit`, IPv4 and IPv6) | Working (queue sized to the rate) |
 | Blocking (`block`, IPv4 and IPv6) | Working |
-| DNS redirection (`redirect --dns`) | Works against clients using plain (port 53) DNS |
-| Captive portal / HTTP redirect (`redirect`, `--to`, `--harden`, `--lockdown`) | **Experimental on macOS** |
+| DNS redirection (`redirect --dns` / `--to`) | Working, via DNS injection |
+| Enforcement (`--harden` / `--lockdown`, force-IPv4) | Working |
+| HTTPS/HTTP interception (`redirect --mitm`) | Works for clients that trust the CA or don't strictly validate |
 
-`redirect` builds its DNS and `rdr` rules correctly, but transparently capturing a
-spoofed device's **forwarded** traffic is unreliable on macOS: the kernel does not
-consistently deliver `rdr`-rewritten forwarded packets to a local socket, so the
-built-in DNS server and proxy may receive nothing even though the rules match.
-Limiting, blocking and IPv6 forcing are unaffected. Treat the portal/redirect
-modes as experimental for now.
+Redirection is done by **DNS injection**: the tool sniffs the target's DNS
+(while ARP-spoofed) and injects forged answers, which is reliable on macOS where
+transparent `pf rdr` is not. `--dns` maps one domain to an IP; `--to` maps every
+domain to one IP; `--harden` blocks DoT/DoH and the Private-Relay/DoH canaries so
+the device falls back to the plain DNS we forge; `--lockdown` allows only DNS,
+DHCP and the target.
+
+`--mitm` adds a full HTTPS/HTTP intercepting proxy: a local CA (generated once in
+`~/.evillimiter/ca/`) mints a per-host certificate on the fly, the proxy
+terminates TLS, relays to the real site, and logs every request. It intercepts
+any client that trusts the CA (install `evillimiter-ca.crt` on devices you
+control) or that does not strictly validate certificates. A strict browser on a
+pinned or HSTS-preloaded site still needs the CA installed on the device, which
+is a property of TLS, not of this tool.
 
 ## System Requirements
 

@@ -4,3 +4,4 @@ netifaces
 tqdm
 scapy
 terminaltables
+cryptography

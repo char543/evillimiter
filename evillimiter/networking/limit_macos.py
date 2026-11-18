@@ -32,17 +32,21 @@ class MacOSLimiter(object):
         """
         host_ids = self._new_host_limit_ids(host, direction)
 
-        # Create dummynet pipes for bandwidth limiting
+        # Create dummynet pipes. Size the queue to the rate: dummynet's tiny
+        # default queue (~50 slots) starves a high-bandwidth pipe, so a 1gbit
+        # limit only reaches a fraction of the set rate. Use ~100ms of buffer,
+        # floored at 64KB and capped at 8MB.
+        rate_kbps = rate.rate // 1000
+        # macOS dnctl rejects a byte queue >= 1,000,000 bytes ("< 1MB"). With KB
+        # = 1024 bytes the true max is 976 KB; 950 KB (972,800 B) stays safely
+        # under. On a LAN this is already well past the bandwidth-delay product,
+        # so larger values would only add latency, not throughput.
+        queue_kbytes = int(max(64, min(950, (rate.rate / 1_000_000) * 12)))
         if (direction & Direction.OUTGOING) == Direction.OUTGOING:
-            # Convert rate to kbps format for dnctl
-            rate_kbps = rate.rate // 1000  # Convert bits to kbps
-            result = shell.execute_suppressed('{} pipe {} config bw {}Kbit/s'.format(BIN_DNCTL, host_ids.upload_id, rate_kbps))
-            if result != 0:
+            if not self._config_pipe(host_ids.upload_id, rate_kbps, queue_kbytes):
                 print(f"Warning: Failed to create upload pipe {host_ids.upload_id}")
         if (direction & Direction.INCOMING) == Direction.INCOMING:
-            rate_kbps = rate.rate // 1000  # Convert bits to kbps  
-            result = shell.execute_suppressed('{} pipe {} config bw {}Kbit/s'.format(BIN_DNCTL, host_ids.download_id, rate_kbps))
-            if result != 0:
+            if not self._config_pipe(host_ids.download_id, rate_kbps, queue_kbytes):
                 print(f"Warning: Failed to create download pipe {host_ids.download_id}")
 
         # Generate and load pfctl rules
@@ -140,6 +144,20 @@ class MacOSLimiter(object):
 
         id1 = generate_id()
         return (id1, generate_id(id1))
+
+    def _config_pipe(self, pipe_id, rate_kbps, queue_kbytes):
+        """
+        Configure a dummynet pipe. Try a rate-sized queue first (fills the pipe
+        at high bandwidth), but ALWAYS fall back to a plain bw config if dnctl
+        rejects the queue syntax, so traffic is never routed to a pipe that was
+        never created (which would blackhole the host).
+        """
+        sized = '{} pipe {} config bw {}Kbit/s queue {}Kbytes'.format(
+            BIN_DNCTL, pipe_id, rate_kbps, queue_kbytes)
+        if shell.execute_suppressed(sized) == 0:
+            return True
+        plain = '{} pipe {} config bw {}Kbit/s'.format(BIN_DNCTL, pipe_id, rate_kbps)
+        return shell.execute_suppressed(plain) == 0
 
     def _delete_dummynet_pipe(self, pipe_id):
         """
