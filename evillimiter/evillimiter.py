@@ -1,6 +1,7 @@
 import re
 import os
 import os.path
+import signal
 import argparse
 import platform
 import collections
@@ -146,12 +147,33 @@ def initialize(interface):
 
 def cleanup(interface):
     """
-    Resets what has been initialized
+    Resets what has been initialized. Each step is independent and best-effort
+    so one failure never prevents the rest from running.
     """
-    netutils.delete_qdisc_root(interface)
-    netutils.disable_ip_forwarding()
-    netutils.disable_ipv6_forwarding()
-    netutils.flush_pf_rules()
+    for step in (
+        lambda: netutils.delete_qdisc_root(interface),
+        netutils.disable_ip_forwarding,
+        netutils.disable_ipv6_forwarding,
+        netutils.flush_pf_rules,
+    ):
+        try:
+            step()
+        except Exception:
+            pass
+
+
+def teardown(menu, interface):
+    """
+    Full, idempotent, exception-safe shutdown. Restores every spoofed host
+    (re-asserting the real ARP/NDP mappings so the victim, the router and this
+    machine recover without a manual Wi-Fi bounce), then resets our networking
+    state. Safe to call more than once and from any exit path.
+    """
+    try:
+        menu.interrupt_handler(ctrl_c=False)
+    except Exception:
+        pass
+    cleanup(interface)
 
 
 def run():
@@ -178,10 +200,30 @@ def run():
         return
     
     if initialize(args.interface):
-        IO.spacer()        
+        IO.spacer()
         menu = MainMenu(version, args.interface, args.gateway_ip, args.gateway_mac, args.netmask)
-        menu.start()
-        cleanup(args.interface)
+
+        # Guarantee a full teardown no matter how we leave the input loop:
+        # quit/exit, Ctrl-C, Ctrl-D (EOF), an unhandled error in a handler, or a
+        # terminating signal (SIGTERM/SIGHUP from `kill` or a closed terminal).
+        # The finally block always restores state; the signal handler just breaks
+        # the loop so that finally can run instead of the process dying outright.
+        def _signal_handler(_signum, _frame):
+            menu.stop()
+            raise KeyboardInterrupt
+
+        for _sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(_sig, _signal_handler)
+            except (ValueError, OSError):
+                pass  # unsupported signal / not in the main thread
+
+        try:
+            menu.start()
+        except (KeyboardInterrupt, EOFError):
+            pass
+        finally:
+            teardown(menu, args.interface)
 
 
 if __name__ == '__main__':

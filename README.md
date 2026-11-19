@@ -22,6 +22,12 @@ EvilLimiter has been updated to support macOS alongside Linux. The macOS impleme
 | Enforcement (`--harden` / `--lockdown`, force-IPv4) | Working |
 | HTTPS/HTTP interception (`redirect --mitm`) | Works for clients that trust the CA or don't strictly validate |
 
+IPv4 interception uses ARP spoofing; IPv6 uses **NDP** (Neighbor Advertisement)
+spoofing, which starts automatically when an IPv6 gateway is detected (you'll see
+`ipv6 interception active` at launch). Both run together, so `limit` and `block`
+cover a device's IPv4 **and** IPv6 traffic — without the IPv6 side a modern phone
+would simply pull its data over IPv6 and sail past an IPv4-only limit.
+
 Redirection is done by **DNS injection**: the tool sniffs the target's DNS
 (while ARP-spoofed) and injects forged answers, which is reliable on macOS where
 transparent `pf rdr` is not. `--dns` maps one domain to an IP; `--to` maps every
@@ -168,8 +174,8 @@ to pass `PYTHONDONTWRITEBYTECODE`.
      `~/evillimiter` (see Installation)
    - `Permission denied` from `pip`/`pipx` usually means an earlier `sudo` run
      left root-owned `.pyc` files in the virtualenv. Delete the venv with
-     `sudo rm -rf .venv`, recreate it, and always launch with
-     `PYTHONDONTWRITEBYTECODE=1` (see Usage)
+     `sudo rm -rf .venv` and recreate it. `bin/evillimiter` disables bytecode
+     writing itself, so a fresh venv will not pick the problem back up
 
 3. **pfctl errors:**
 
@@ -180,19 +186,15 @@ to pass `PYTHONDONTWRITEBYTECODE`.
    - Use `ifconfig` to list available interfaces
    - Specify the interface manually with `-i` flag
 
-### Testing Installation
-
-Run the test script to verify macOS compatibility:
-
-```bash
-python3 test_macos.py
-```
-
 ## Security Considerations
 
 - pfctl rules are temporary and removed when the application exits
-- IP forwarding is restored to original state on cleanup
+- IP forwarding is restored to its original state on cleanup
 - Temporary rule files are securely created and cleaned up
+- Teardown is guaranteed on every exit path — `quit`/`exit`, Ctrl-C, Ctrl-D,
+  an unhandled error, or a `SIGTERM`/`SIGHUP` (closed terminal, `kill`). On exit
+  the tool re-asserts the real ARP/NDP mappings for every spoofed host, so the
+  target, the router and this machine all recover without a manual Wi-Fi bounce
 
 ## Architecture Support
 
